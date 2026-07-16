@@ -111,6 +111,8 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 					Bucket: aws.String(cfg.Bucket),
 					Key:    aws.String(key),
 					Body:   &sizedReader{remaining: sizeBytes, pattern: pattern, prog: prog},
+				}, func(o *transfermanager.Options) {
+					o.Concurrency = perObjectConcurrency
 				})
 				atomic.AddInt64(&prog.InFlight, -1)
 				if e != nil {
@@ -137,7 +139,7 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 // RunDownload downloads the seeded objects (dataPrefix keys) per size group via
 // the Transfer Manager's GetObject, draining each body to memory (io.Discard).
 // Objects transfer concurrently through a pool of objectConcurrency.
-func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prog *metrics.Progress, objectConcurrency, perObjectConcurrency int) (*bench.RunResult, error) {
+func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prog *metrics.Progress, objectConcurrency, perObjectConcurrency int, getBuffer int64) (*bench.RunResult, error) {
 	if prog == nil {
 		prog = &metrics.Progress{}
 	}
@@ -164,6 +166,11 @@ func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Co
 				out, e := tm.GetObject(ctx, &transfermanager.GetObjectInput{
 					Bucket: aws.String(cfg.Bucket),
 					Key:    aws.String(key),
+				}, func(o *transfermanager.Options) {
+					o.Concurrency = perObjectConcurrency
+					if getBuffer > 0 {
+						o.GetObjectBufferSize = getBuffer
+					}
 				})
 				if e != nil {
 					return fmt.Errorf("GetObject %q: %w", key, e)

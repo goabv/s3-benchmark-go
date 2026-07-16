@@ -9,7 +9,7 @@
 
   "download": {
     "workers": 64,
-    "concurrency": 4,
+    "concurrency": 8,
     "iterations": 1,
     "warmup": 1,
     "validateChecksum": true,
@@ -24,7 +24,7 @@
 
   "upload": {
     "workers": 64,
-    "concurrency": 2,
+    "concurrency": 4,
     "iterations": 1,
     "warmup": 0,
     "keyPrefix": "bench-upload/",

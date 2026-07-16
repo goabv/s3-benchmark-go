@@ -91,27 +91,27 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Resolve the two parallelism dimensions so the total parts in flight
-	// (objectConcurrency x perObjectConcurrency) defaults to the custom runner's
-	// workers x concurrency for an apples-to-apples comparison.
-	targetTotal := cfg.Download.Parallelism()
-	if mode == "upload" {
-		targetTotal = cfg.Upload.Parallelism()
-	}
-	if objectConc <= 0 {
-		objectConc = maxObjectCount(cfg)
-	}
-	perObjectConc := concurrency
-	if perObjectConc <= 0 {
-		perObjectConc = targetTotal / objectConc
-		if perObjectConc < 1 {
-			perObjectConc = 1
-		}
+	tmPartSize, err := config.ParseSize(cfg.PartSize)
+	if err != nil {
+		return err
 	}
 
-	// Size the keep-alive transport to the total parts in flight so connections
-	// aren't the bottleneck; no connection-spreading (isolate the TM's behavior).
-	maxConns := objectConc * perObjectConc
+	// Resolve the two parallelism dimensions PER PHASE so upload reads the upload
+	// section and download reads the download section (the -object-concurrency /
+	// -concurrency flags, when set, override both). Total parts in flight defaults
+	// to that section's workers x concurrency for an apples-to-apples comparison.
+	maxObj := maxObjectCount(cfg)
+	upObjConc, upPerObjConc := resolvePhase(cfg.Upload.Parallelism(), objectConc, concurrency, maxObj)
+	dlObjConc, dlPerObjConc := resolvePhase(cfg.Download.Parallelism(), objectConc, concurrency, maxObj)
+	// GetObject read-ahead is a TOTAL budget (download.maxBufferedBytes, matching
+	// the JS runner) split across the concurrent objects.
+	dlGetBuffer := resolveGetBuffer(cfg.Download.MaxBufferedBytes, dlObjConc, dlPerObjConc, tmPartSize)
+
+	// Size the keep-alive transport to the larger phase's total parts in flight.
+	maxConns := upObjConc * upPerObjConc
+	if d := dlObjConc * dlPerObjConc; d > maxConns {
+		maxConns = d
+	}
 	if maxConns < 64 {
 		maxConns = 64
 	}
@@ -124,31 +124,21 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 		return err
 	}
 
-	tmPartSize, err := config.ParseSize(cfg.PartSize)
-	if err != nil {
-		return err
-	}
-	// GetObject only fetches GetObjectBufferSize/partSize parts ahead of the
-	// consumer (default 50MiB => ~1 part for 32MiB parts), which throttles download
-	// regardless of Concurrency. download.maxBufferedBytes (the same key/value the
-	// JS runner uses, 64GiB) is a TOTAL budget split across the concurrent objects,
-	// since GetObjectBufferSize is per-GetObject-call.
-	getBuffer := resolveGetBuffer(cfg.Download.MaxBufferedBytes, objectConc, perObjectConc, tmPartSize)
+	// One client; per-phase Concurrency and GetObjectBufferSize are applied per
+	// call inside RunUpload/RunDownload via functional options.
 	tm := transfermanager.New(s3c, func(o *transfermanager.Options) {
-		o.Concurrency = perObjectConc
 		if tmPartSize > 0 {
 			o.PartSizeBytes = tmPartSize
 		}
-		o.GetObjectBufferSize = getBuffer
 	})
-	if cfg.Download.MaxBufferedBytes > 0 {
+	if cfg.Download.MaxBufferedBytes > 0 && mode != "upload" {
 		fmt.Printf("tm read-ahead: total-budget=%s across %d objects -> %s/object (%d parts/object)\n\n",
-			humanBytes(cfg.Download.MaxBufferedBytes), objectConc, humanBytes(getBuffer), getBuffer/max64(tmPartSize, 1))
+			humanBytes(cfg.Download.MaxBufferedBytes), dlObjConc, humanBytes(dlGetBuffer), dlGetBuffer/max64(tmPartSize, 1))
 	}
 
 	// "both" runs upload first, then download — each sampled and reported
 	// independently so the numbers never mix.
-	phases := phasesFor(mode, ctx, tm, cfg, prefix, objectConc, perObjectConc)
+	phases := phasesFor(mode, ctx, tm, cfg, prefix, upObjConc, upPerObjConc, dlObjConc, dlPerObjConc, dlGetBuffer)
 
 	startedAt := time.Now()
 	var runs []*bench.RunResult
@@ -202,12 +192,15 @@ type phase struct {
 }
 
 // phasesFor expands a mode into ordered phases. "both" is upload then download.
-func phasesFor(mode string, ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prefix string, objectConc, perObjectConc int) []phase {
+// Upload and download carry their own (object, per-object) concurrency, resolved
+// per config section.
+func phasesFor(mode string, ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prefix string,
+	upObjConc, upPerObjConc, dlObjConc, dlPerObjConc int, dlGetBuffer int64) []phase {
 	upload := phase{"tm-upload", func(p *metrics.Progress) (*bench.RunResult, error) {
-		return tmbench.RunUpload(ctx, tm, cfg, p, prefix, objectConc, perObjectConc)
+		return tmbench.RunUpload(ctx, tm, cfg, p, prefix, upObjConc, upPerObjConc)
 	}}
 	download := phase{"tm-download", func(p *metrics.Progress) (*bench.RunResult, error) {
-		return tmbench.RunDownload(ctx, tm, cfg, p, objectConc, perObjectConc)
+		return tmbench.RunDownload(ctx, tm, cfg, p, dlObjConc, dlPerObjConc, dlGetBuffer)
 	}}
 	switch mode {
 	case "upload":
@@ -314,6 +307,28 @@ func humanBytes(n int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// resolvePhase derives (objectConcurrency, perObjectConcurrency) for a phase.
+// The flags (objFlag/concFlag) override when > 0; otherwise object-concurrency
+// defaults to the object count and per-object-concurrency to total/objects so the
+// total parts in flight matches that section's workers x concurrency.
+func resolvePhase(total, objFlag, concFlag, maxObjects int) (objectConc, perObjectConc int) {
+	objectConc = objFlag
+	if objectConc <= 0 {
+		objectConc = maxObjects
+	}
+	if objectConc < 1 {
+		objectConc = 1
+	}
+	perObjectConc = concFlag
+	if perObjectConc <= 0 {
+		perObjectConc = total / objectConc
+		if perObjectConc < 1 {
+			perObjectConc = 1
+		}
+	}
+	return objectConc, perObjectConc
 }
 
 // maxObjectCount returns the largest object count across configured size groups.
