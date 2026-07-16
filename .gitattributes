@@ -1,0 +1,8 @@
+# Normalize line endings. Shell scripts MUST be LF so they run on the Linux
+# EC2 host (CRLF would cause "bad interpreter" errors).
+* text=auto
+*.sh text eol=lf
+*.go text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.ps1 text eol=crlf

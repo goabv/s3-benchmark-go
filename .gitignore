@@ -1,0 +1,17 @@
+# Go build output
+/bench
+/bench.exe
+/tmbench
+/tmbench.exe
+/dist/
+*.test
+*.out
+
+# Large data / scratch artifacts never belong in git.
+*.bin
+
+# Benchmark results: COMMIT curated runs under results/runs/, but ignore the
+# scratch output the raw sweeps/tools drop directly in results/ (loose sweep
+# JSON, ad-hoc CSV/SVG).
+results/*
+!results/runs/
