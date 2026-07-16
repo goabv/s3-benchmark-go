@@ -93,6 +93,7 @@ type GroupResult struct {
 	Best      Sample3
 	Resources Resources
 	PartTime  PartTimeStats
+	TTFB      PartTimeStats // download time-to-first-byte (console only; not in sweep JSON)
 	TLS       TLSInfo
 
 	// captured detail

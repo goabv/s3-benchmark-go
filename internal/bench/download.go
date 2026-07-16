@@ -81,9 +81,6 @@ func RunDownload(ctx context.Context, client *s3.Client, cfg *config.Config, pro
 		mode, deliveryDetail(cfg, partSize), cfg.Download.ValidateChecksum, cfg.Download.SpreadConnections,
 		cfg.Download.Workers, cfg.Download.Concurrency, cfg.Download.Iterations, cfg.Download.Warmup)
 
-	fmt.Printf("%-12s %6s %7s %10s %10s\n", "size", "parts", "files", "med Gbps", "med MiB/s")
-	fmt.Printf("--------------------------------------------------------\n")
-
 	var files *fileSink
 	if mode == deliveryFile {
 		files = newFileSink(cfg.Download.DeliveryPath)
@@ -160,6 +157,7 @@ func RunDownload(ctx context.Context, client *s3.Client, cfg *config.Config, pro
 			Median:                 median(samples),
 			Best:                   best(samples),
 			PartTime:               toPartTimeStats(run.timing.Percentiles()),
+			TTFB:                   toPartTimeStats(run.ttfb.Percentiles()),
 			TLS:                    TLSInfo{Protocol: proto, Cipher: cipher},
 			Parts_:                 run.parts.snapshot(),
 			DistinctIPs:            distinct,
@@ -167,11 +165,6 @@ func RunDownload(ctx context.Context, client *s3.Client, cfg *config.Config, pro
 			Retries:                int(atomic.LoadInt64(&run.retries)),
 		}
 		result.Groups = append(result.Groups, gr)
-
-		ttfb := toPartTimeStats(run.ttfb.Percentiles())
-		fmt.Printf("%-12s %6d %7d %10.3f %10.1f\n", gr.Label, gr.Parts, gr.Files, gr.Median.Gbps, gr.Median.Mibps)
-		fmt.Printf("  ttfb ms  p50=%.1f p90=%.1f p99=%.1f p99.9=%.1f | front-end IPs=%d  conn-reuse=%.0f%%  retries=%d\n\n",
-			ttfb.P50, ttfb.P90, ttfb.P99, ttfb.P999, gr.DistinctIPs, gr.ReuseRatio*100, gr.Retries)
 	}
 	return result, nil
 }

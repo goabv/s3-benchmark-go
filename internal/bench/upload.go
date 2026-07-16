@@ -63,9 +63,6 @@ func RunUpload(ctx context.Context, client *s3.Client, cfg *config.Config, prog 
 		cfg.PartSize, checksum, cfg.Download.SpreadConnections, cfg.Upload.Workers, cfg.Upload.Concurrency,
 		cfg.Upload.Iterations, cfg.Upload.Warmup)
 
-	fmt.Printf("%-12s %6s %7s %10s %10s\n", "size", "parts", "files", "med Gbps", "med MiB/s")
-	fmt.Printf("--------------------------------------------------------\n")
-
 	result := &RunResult{Mode: "upload"}
 	for _, spec := range cfg.Sizes {
 		sizeBytes, err := config.ParseSize(spec.Size)
@@ -133,11 +130,6 @@ func RunUpload(ctx context.Context, client *s3.Client, cfg *config.Config, prog 
 			Retries:      int(atomic.LoadInt64(&run.retries)),
 		}
 		result.Groups = append(result.Groups, gr)
-
-		fmt.Printf("%-12s %6d %7d %10.3f %10.1f\n", gr.Label, gr.Parts, gr.Files, gr.Median.Gbps, gr.Median.Mibps)
-		fmt.Printf("  part ms  p50=%.1f p90=%.1f p99=%.1f p99.9=%.1f | front-end IPs=%d  conn-reuse=%.0f%%  retries=%d\n\n",
-			gr.PartTime.P50, gr.PartTime.P90, gr.PartTime.P99, gr.PartTime.P999,
-			gr.DistinctIPs, gr.ReuseRatio*100, gr.Retries)
 	}
 	return result, nil
 }

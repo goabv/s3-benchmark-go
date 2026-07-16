@@ -87,7 +87,6 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 	fmt.Printf("region=%s  bucket=%s  keyPrefix=%s  source=memory\n", cfg.Region, cfg.Bucket, keyPrefix)
 	fmt.Printf("object-concurrency=%d  per-object part-concurrency=%d  ~parts-in-flight=%d  iterations=%d (warmup=%d)\n\n",
 		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, cfg.Upload.Iterations, cfg.Upload.Warmup)
-	printHeader()
 
 	result := &bench.RunResult{Mode: "tm-upload"}
 	for _, spec := range cfg.Sizes {
@@ -131,7 +130,6 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 		nparts := int((sizeBytes+partSize-1)/partSize) * count
 		// The Transfer Manager computes a CRC32 checksum on upload by default.
 		result.Groups = append(result.Groups, group(spec, sizeBytes, count, nparts, objectConcurrency, perObjectConcurrency, samples, true))
-		printRow(result.Groups[len(result.Groups)-1])
 	}
 	return result, nil
 }
@@ -148,7 +146,6 @@ func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Co
 	fmt.Printf("region=%s  bucket=%s  sink=memory(discard)\n", cfg.Region, cfg.Bucket)
 	fmt.Printf("object-concurrency=%d  per-object part-concurrency=%d  ~parts-in-flight=%d  iterations=%d (warmup=%d)\n\n",
 		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, cfg.Download.Iterations, cfg.Download.Warmup)
-	printHeader()
 
 	result := &bench.RunResult{Mode: "tm-download"}
 	for _, spec := range cfg.Sizes {
@@ -190,7 +187,6 @@ func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Co
 		}
 
 		result.Groups = append(result.Groups, group(spec, perFileSize, len(keys), 0, objectConcurrency, perObjectConcurrency, samples, cfg.Download.ValidateChecksum))
-		printRow(result.Groups[len(result.Groups)-1])
 	}
 	return result, nil
 }
@@ -303,13 +299,4 @@ func sanitize(s string) string {
 		}
 	}
 	return string(out)
-}
-
-func printHeader() {
-	fmt.Printf("%-12s %6s %7s %10s %10s\n", "size", "parts", "files", "med Gbps", "med MiB/s")
-	fmt.Printf("--------------------------------------------------------\n")
-}
-
-func printRow(g bench.GroupResult) {
-	fmt.Printf("%-12s %6d %7d %10.3f %10.1f\n", g.Label, g.Parts, g.Files, g.Median.Gbps, g.Median.Mibps)
 }
