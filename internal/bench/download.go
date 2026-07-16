@@ -380,10 +380,12 @@ func (r *downloadRun) doGet(ctx context.Context, j job, consume func(body io.Rea
 		return 0, rerr
 	}
 
-	r.timing.Add(total)
-	r.ttfb.Add(ttfb)
-	r.ips.record(ci)
+	// Record stats for measured iterations only (exclude warmup) so the reported
+	// percentiles and part count reflect "measured iterations".
 	if iter := atomic.LoadInt32(&r.iter); iter >= 0 {
+		r.timing.Add(total)
+		r.ttfb.Add(ttfb)
+		r.ips.record(ci)
 		r.parts.add(PartRecord{
 			Iter:  int(iter),
 			Key:   j.key,

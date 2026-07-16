@@ -260,9 +260,10 @@ func (r *uploadRun) uploadPart(ctx context.Context, key, uploadID string, part i
 		return "", rerr
 	}
 
-	r.timing.Add(dur)
-	r.ips.record(ci)
+	// Record stats for measured iterations only (exclude warmup).
 	if iter := atomic.LoadInt32(&r.iter); iter >= 0 {
+		r.timing.Add(dur)
+		r.ips.record(ci)
 		r.parts.add(PartRecord{
 			Iter:  int(iter),
 			Key:   key,
