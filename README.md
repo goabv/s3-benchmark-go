@@ -1,19 +1,20 @@
 # S3 Benchmark Runner (Go)
 
-An S3 multipart (ranged-GET by PartNumber) throughput benchmark built on the AWS
-SDK for Go v2. It's the Go counterpart to the Node.js `s3-benchmark-runner`, and
-targets the **same seeded S3 objects** (identical `bench.config.json` schema and
-key naming), so results are directly comparable across stacks.
+A high-throughput S3 benchmark built on the AWS SDK for Go v2. It has two runners
+that target the **same seeded S3 objects** (same `bench.config.json`), on the same
+host and config, so their numbers are directly comparable:
 
-## Why Go is structurally simpler than the Node build
+- **custom runner** (`cmd/bench`) — a hand-tuned parallel ranged-GET-by-PartNumber
+  downloader and multipart-PUT uploader: shared worker pool, delivery modes
+  (discard / ordered-stream / file), per-part timing, retries, stall watchdog, and
+  connection spreading.
+- **Transfer Manager runner** (`cmd/tmbench`) — the same workload run through the
+  **latest AWS SDK for Go v2 S3 Transfer Manager** (`feature/s3/transfermanager`)
+  as an out-of-the-box baseline, using its `UploadObject` / `GetObject` operations.
 
-The Node version needs worker threads to use all cores, which forces per-worker
-S3 clients and a credential-sharing problem (provider functions can't be
-structured-cloned across threads). In Go, goroutines share the process's memory,
-so a single `s3.Client` and its `aws.CredentialsCache` are used by every
-goroutine: signing is distributed for free, and credential refresh is handled
-once for all in-flight requests by the SDK. No worker threads, no MessagePort
-credential bridge.
+The point of the project is to measure the custom runner against the SDK's Transfer
+Manager on identical objects, hardware, and configuration. The Transfer Manager
+dependency is pinned in `go.mod`; bump it to track the latest release.
 
 ## Layout
 
@@ -52,7 +53,7 @@ go run ./cmd/bench -mode upload       # multipart-PUT throughput
 go run ./cmd/bench -mode both         # upload then download, reported separately
 ```
 
-Per-run overrides (take precedence over the config, matching the JS sweep flags):
+Per-run overrides (take precedence over the config):
 
 ```sh
 go run ./cmd/bench -mode download -workers 60 -concurrency 5 -iterations 3 -warmup 1 -part-size 32MiB
@@ -68,7 +69,7 @@ EC2 instance role). On the benchmark EC2 host the instance role is used.
 
 ## Transfer Manager baseline (`tmbench`)
 
-A separate runner benchmarks the AWS SDK for Go v2 **S3 Transfer Manager**
+A separate runner benchmarks the **latest AWS SDK for Go v2 S3 Transfer Manager**
 (`feature/s3/transfermanager`) as an out-of-the-box baseline, using its
 single-object `UploadObject` / `GetObject` operations with **fully in-memory**
 data — no local files:
@@ -109,8 +110,8 @@ On EC2: `./scripts/tm-run.sh both [label]` (extra flags pass through, e.g.
 `GetObjectBufferSize / partSize` parts ahead of the consumer, and
 `GetObjectBufferSize` defaults to just **50 MiB** — so with 32 MiB parts it fetches
 only ~1 part at a time regardless of `Concurrency`, which throttles download hard.
-`tmbench` drives `GetObjectBufferSize` from the same `download.maxBufferedBytes`
-config key (and 64 GiB value) the JS runner uses. Because `GetObjectBufferSize` is
+`tmbench` drives `GetObjectBufferSize` from the `download.maxBufferedBytes` config
+key (default 64 GiB). Because `GetObjectBufferSize` is
 per-`GetObject`-call, that value is treated as a **total** budget and split across
 the objects in flight (`maxBufferedBytes / object-concurrency`, floored at one part
 per object), so peak read-ahead memory stays ≈ the configured total rather than
@@ -138,7 +139,7 @@ In `both` mode (either runner) the phases run **upload first, then download**, b
 each phase is sampled and reported **independently** — its own throughput, its own
 resource table, and its own `*-sweep.json`. Nothing is averaged across phases.
 
-Two ways to run, mirroring the JS runner:
+Two ways to run:
 
 - `run.sh <download|upload|both> [label]` — a **committable** run: writes the full
   `results/runs/<stamp>[-label]/` directory (config, env, sweep JSON, summary, CSV,
@@ -159,7 +160,7 @@ Two ways to run, mirroring the JS runner:
 ## Run on EC2 c7gn.16xlarge (Graviton3, arm64, ~200 Gbps)
 
 You develop on Windows and build **on the instance**. S3 is the transport, so no
-SSH key handling is needed for the code itself — the same model as the JS runner.
+SSH key handling is needed for the code itself.
 
 **1. Push source from Windows** (uses your AWS creds; syncs to `s3://<bucket>/<codePrefix>`):
 
@@ -204,8 +205,6 @@ code prefix (pull), and `s3:PutObject` on the results prefix (`results.upload`).
 
 ## Config (`bench.config.json`)
 
-Same shape and keys as the JS project.
-
 | key | meaning |
 |-----|---------|
 | `bucket` / `region` | target bucket and region |
@@ -233,8 +232,9 @@ Same shape and keys as the JS project.
 
 ## Output
 
-Each run creates a run directory `results/runs/<YYYYMMDDThhmmss>[-label]/`, matching
-the JS runner's layout so results are directly comparable across stacks:
+Each run creates a run directory `results/runs/<YYYYMMDDThhmmss>[-label]/`. The
+custom and Transfer Manager runners use the same layout so their runs are directly
+comparable:
 
 | file | contents |
 |------|----------|
@@ -257,8 +257,7 @@ With `results.upload` the whole run directory is mirrored to
 
 ## Delivery modes and what they measure
 
-`download.deliveryMode` selects the sink each part is written to, matching the JS
-runner's three modes:
+`download.deliveryMode` selects the sink each downloaded part is written to:
 
 | mode | what it does | memory profile |
 |------|--------------|----------------|
@@ -284,10 +283,9 @@ match or beat the TM while doing the same ordered-delivery work. The benchmark d
 each object's reader with `io.Copy(io.Discard, reader)` — the same path a real
 consumer would drive.
 
-`CPU%` is normalized to "% of all cores" (100% = every vCPU saturated), matching
-the JS convention.
+`CPU%` is normalized to "% of all cores" (100% = every vCPU saturated).
 
-## Feature status (parity with the JS runner)
+## Feature status
 
 - [x] Upload benchmark (multipart PUT) with abort-on-error cleanup
 - [x] Ordered-stream delivery as a consumable `io.Reader`/`io.WriterTo` (`deliveryMode: ordered-stream`)
