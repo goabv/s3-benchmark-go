@@ -41,13 +41,10 @@ type downloadRun struct {
 	ttfb     *metrics.Recorder // time to first byte
 	parts    *partRecorder
 	retries  int64
-	mode     string        // delivery mode
-	partSize int64         // configured part size (byte offsets, budget accounting)
-	files    *fileSink     // file mode only
-	sem      chan struct{} // ordered-stream buffered-bytes budget (nil = unbounded)
-	orderers map[string]*orderer
-	ordMu    sync.Mutex
-	iter     int32 // current measured-iteration index; <0 during warmup (no CSV rows)
+	mode     string    // delivery mode
+	partSize int64     // configured part size (byte offsets, channel sizing)
+	files    *fileSink // file mode only
+	iter     int32     // current measured-iteration index; <0 during warmup (no CSV rows)
 }
 
 // RunDownload benchmarks parallel ranged (PartNumber) GETs for every configured
@@ -116,7 +113,6 @@ func RunDownload(ctx context.Context, client *s3.Client, cfg *config.Config, pro
 			mode:     mode,
 			partSize: partSize,
 			files:    files,
-			sem:      newBudget(cfg.Download.MaxBufferedBytes, partSize, mode),
 		}
 
 		var measured []iterResult
@@ -169,19 +165,6 @@ func RunDownload(ctx context.Context, client *s3.Client, cfg *config.Config, pro
 	return result, nil
 }
 
-// newBudget builds the ordered-stream buffered-bytes semaphore, or nil when the
-// mode isn't ordered-stream or no cap is configured.
-func newBudget(maxBufferedBytes, partSize int64, mode string) chan struct{} {
-	if mode != deliveryOrdered || maxBufferedBytes <= 0 || partSize <= 0 {
-		return nil
-	}
-	slots := int(maxBufferedBytes / partSize)
-	if slots < 1 {
-		slots = 1
-	}
-	return make(chan struct{}, slots)
-}
-
 func deliveryDetail(cfg *config.Config, partSize int64) string {
 	switch cfg.Download.DeliveryMode {
 	case deliveryFile:
@@ -216,12 +199,11 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.0f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-// runOnce drives one full pass over the job set with a fixed-size goroutine pool.
+// runOnce drives one full pass over the job set. ordered-stream uses a per-object
+// streaming reader; discard/file drain each part independently.
 func (r *downloadRun) runOnce(ctx context.Context, jobs []job, parallelism int) (iterResult, error) {
 	if r.mode == deliveryOrdered {
-		r.ordMu.Lock()
-		r.orderers = map[string]*orderer{}
-		r.ordMu.Unlock()
+		return r.runOnceOrdered(ctx, jobs, parallelism)
 	}
 
 	jobCh := make(chan job, parallelism*2)
@@ -263,22 +245,105 @@ func (r *downloadRun) runOnce(ctx context.Context, jobs []job, parallelism int) 
 	return iterResult{Bytes: totalBytes, Parts: len(jobs), Elapsed: elapsed}, nil
 }
 
-// fetchPart downloads one part (ranged GET by PartNumber) with retry, per-part
-// timing, connection-trace capture, and delivery to the configured sink.
-func (r *downloadRun) fetchPart(ctx context.Context, j job) (nbytes int64, err error) {
-	// ordered-stream budget: hold at most maxBufferedBytes worth of parts at once.
-	if r.sem != nil {
-		r.sem <- struct{}{}
+// runOnceOrdered runs a pass where each object is delivered as one in-order
+// stream (orderedReader). A consumer goroutine per object drains its reader via
+// io.Copy (the zero-copy WriteTo path) to io.Discard — standing in for a real
+// consumer that would receive the object's bytes in order. Fetch workers pull
+// parts from a shared pool and push them to the owning object's reader.
+func (r *downloadRun) runOnceOrdered(ctx context.Context, jobs []job, parallelism int) (iterResult, error) {
+	npartsByKey := map[string]int32{}
+	for _, j := range jobs {
+		if j.part > npartsByKey[j.key] {
+			npartsByKey[j.key] = j.part
+		}
+	}
+	capBuffers := r.channelCap(len(npartsByKey))
+
+	readers := make(map[string]*orderedReader, len(npartsByKey))
+	var totalBytes int64
+	var firstErr atomic.Value
+	var consumers sync.WaitGroup
+	for key, np := range npartsByKey {
+		rd := newOrderedReader(np, capBuffers, r.pool)
+		readers[key] = rd
+		consumers.Add(1)
+		go func(rd *orderedReader) {
+			defer consumers.Done()
+			n, err := io.Copy(io.Discard, rd) // takes WriteTo -> zero extra copy
+			atomic.AddInt64(&totalBytes, n)
+			if err != nil && firstErr.Load() == nil {
+				firstErr.Store(err)
+			}
+		}(rd)
 	}
 
+	jobCh := make(chan job, parallelism*2)
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := 0; i < parallelism; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobCh {
+				if err := r.fetchPartTo(ctx, j, readers[j.key]); err != nil {
+					if firstErr.Load() == nil {
+						firstErr.Store(err)
+					}
+				}
+			}
+		}()
+	}
+	for _, j := range jobs {
+		if firstErr.Load() != nil {
+			break
+		}
+		jobCh <- j
+	}
+	close(jobCh)
+	wg.Wait()
+
+	// On error some readers may never see their final part; unblock their consumers.
+	if firstErr.Load() != nil {
+		for _, rd := range readers {
+			rd.abort()
+		}
+	}
+	consumers.Wait()
+	elapsed := time.Since(start)
+
+	if e := firstErr.Load(); e != nil {
+		return iterResult{}, e.(error)
+	}
+	return iterResult{Bytes: totalBytes, Parts: len(jobs), Elapsed: elapsed}, nil
+}
+
+// channelCap sizes each object's delivery channel from the buffered-bytes budget,
+// split across the objects in flight (at least a few buffers).
+func (r *downloadRun) channelCap(nkeys int) int {
+	if nkeys < 1 {
+		nkeys = 1
+	}
+	if r.cfg.Download.MaxBufferedBytes <= 0 || r.partSize <= 0 {
+		return 4
+	}
+	per := int(r.cfg.Download.MaxBufferedBytes/r.partSize) / nkeys
+	if per < 1 {
+		per = 1
+	}
+	return per
+}
+
+// doGet performs one retried, traced, timed ranged GET and hands the body to
+// consume, which delivers/drains it and returns the byte count. It records the
+// per-part timing, TTFB, connection, and CSV row on success.
+func (r *downloadRun) doGet(ctx context.Context, j job, consume func(body io.Reader) (int64, error)) (int64, error) {
 	var ci connInfo
 	var ttfb, total time.Duration
-	var delivered *[]byte // ordered mode: the buffer to hand to the orderer on success
+	var nbytes int64
 	attempts := r.cfg.Download.MaxRetries + 1
 
 	tries, rerr := retry(ctx, attempts, func() error {
 		ci = connInfo{}
-		delivered = nil
 		t0 := time.Now()
 		atomic.AddInt64(&r.prog.InFlight, 1)
 		defer atomic.AddInt64(&r.prog.InFlight, -1)
@@ -291,7 +356,6 @@ func (r *downloadRun) fetchPart(ctx context.Context, j job) (nbytes int64, err e
 		if r.cfg.Download.ValidateChecksum {
 			in.ChecksumMode = types.ChecksumModeEnabled
 		}
-
 		out, e := r.client.GetObject(withConnTrace(ctx, &ci), in)
 		if e != nil {
 			return e
@@ -299,39 +363,11 @@ func (r *downloadRun) fetchPart(ctx context.Context, j job) (nbytes int64, err e
 		ttfb = time.Since(t0)
 		defer out.Body.Close()
 
-		switch r.mode {
-		case deliveryFile:
-			buf := r.pool.Get()
-			nb, n, se := streamInto(buf, out.Body)
-			if se != nil {
-				r.pool.Put(nb)
-				return se
-			}
-			off := int64(j.part-1) * r.partSize
-			if we := r.files.writeAt(j.key, off, *nb); we != nil {
-				r.pool.Put(nb)
-				return we
-			}
-			r.pool.Put(nb)
-			nbytes = n
-
-		case deliveryOrdered:
-			buf := r.pool.Get()
-			nb, n, se := streamInto(buf, out.Body)
-			if se != nil {
-				r.pool.Put(nb)
-				return se
-			}
-			delivered = nb // handed to the orderer after the retry loop succeeds
-			nbytes = n
-
-		default: // discard
-			n, ce := io.Copy(io.Discard, out.Body)
-			if ce != nil {
-				return ce
-			}
-			nbytes = n
+		n, ce := consume(out.Body)
+		if ce != nil {
+			return ce
 		}
+		nbytes = n
 		total = time.Since(t0)
 		atomic.AddInt64(&r.prog.Bytes, nbytes)
 		return nil
@@ -341,29 +377,7 @@ func (r *downloadRun) fetchPart(ctx context.Context, j job) (nbytes int64, err e
 		atomic.AddInt64(&r.retries, int64(tries-1))
 	}
 	if rerr != nil {
-		if delivered != nil {
-			r.pool.Put(delivered)
-		}
-		if r.sem != nil {
-			<-r.sem // never delivered; free the slot
-		}
 		return 0, rerr
-	}
-
-	// Ordered delivery + budget release happen once, after a successful fetch.
-	if r.mode == deliveryOrdered {
-		flushed, de := r.ordererFor(j.key).deliver(j.part, delivered)
-		if de != nil {
-			if r.sem != nil {
-				<-r.sem
-			}
-			return 0, de
-		}
-		if r.sem != nil {
-			for k := 0; k < flushed; k++ {
-				<-r.sem
-			}
-		}
 	}
 
 	r.timing.Add(total)
@@ -382,15 +396,44 @@ func (r *downloadRun) fetchPart(ctx context.Context, j job) (nbytes int64, err e
 	return nbytes, nil
 }
 
-func (r *downloadRun) ordererFor(key string) *orderer {
-	r.ordMu.Lock()
-	defer r.ordMu.Unlock()
-	o := r.orderers[key]
-	if o == nil {
-		o = newOrderer(io.Discard, r.pool)
-		r.orderers[key] = o
-	}
-	return o
+// fetchPart handles discard and file delivery (each part drained independently).
+func (r *downloadRun) fetchPart(ctx context.Context, j job) (int64, error) {
+	return r.doGet(ctx, j, func(body io.Reader) (int64, error) {
+		if r.mode == deliveryFile {
+			buf := r.pool.Get()
+			nb, n, se := streamInto(buf, body)
+			if se != nil {
+				r.pool.Put(nb)
+				return 0, se
+			}
+			off := int64(j.part-1) * r.partSize
+			if we := r.files.writeAt(j.key, off, *nb); we != nil {
+				r.pool.Put(nb)
+				return 0, we
+			}
+			r.pool.Put(nb)
+			return n, nil
+		}
+		return io.Copy(io.Discard, body) // discard
+	})
+}
+
+// fetchPartTo handles ordered-stream delivery: read the part into a pooled buffer
+// and push it (in-order-transferring ownership) to the object's reader.
+func (r *downloadRun) fetchPartTo(ctx context.Context, j job, rd *orderedReader) error {
+	_, err := r.doGet(ctx, j, func(body io.Reader) (int64, error) {
+		buf := r.pool.Get()
+		nb, n, se := streamInto(buf, body)
+		if se != nil {
+			r.pool.Put(nb)
+			return 0, se
+		}
+		if pe := rd.push(j.part, nb); pe != nil { // ownership -> reader/consumer
+			return 0, pe
+		}
+		return n, nil
+	})
+	return err
 }
 
 // partsCount returns how many parts an object was uploaded with. A HeadObject

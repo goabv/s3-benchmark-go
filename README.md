@@ -263,7 +263,7 @@ runner's three modes:
 | mode | what it does | memory profile |
 |------|--------------|----------------|
 | `discard` (default) | drain each part to `io.Discard`, count bytes; no ordering | low, flat (~100-200 MB) — nothing is buffered |
-| `ordered-stream` | reassemble parts in ascending order through a recycled buffer pool, bounded by `maxBufferedBytes` | rises with the reorder window (roughly `maxBufferedBytes`, or `parallelism x partSize` when uncapped) |
+| `ordered-stream` | reassemble parts in ascending order and deliver them as one consumable stream per object (see below), bounded by `maxBufferedBytes` | rises with the reorder window (roughly `maxBufferedBytes`) |
 | `file` | write each part to disk at its byte offset under `deliveryPath` (positional `WriteAt`) | low RSS, but adds disk-write throughput as the bottleneck/sink |
 
 This is why the resource table's memory % depends on the mode: in the default
@@ -271,13 +271,26 @@ This is why the resource table's memory % depends on the mode: in the default
 at full network throughput. Switch to `ordered-stream` to hold parts in memory for
 in-order delivery, or `file` to measure with a real disk sink.
 
+### ordered-stream is a real, consumable stream
+
+`ordered-stream` delivers each object as one in-order `io.Reader` (an
+`orderedReader`), exactly like the Transfer Manager's `GetObject` `Body` — so it's
+equally ergonomic for a real consumer (drop it into `io.Copy`, a decoder, a hasher,
+etc.). It also implements `io.WriterTo`, so `io.Copy` hands each pooled part buffer
+straight to the destination and recycles it with **no intermediate copy**. The TM's
+reader is `Read`-only, so `io.Copy` from it always copies through a temp buffer; the
+custom `ordered-stream` avoids that copy on the `io.Copy`/`WriterTo` path, so it can
+match or beat the TM while doing the same ordered-delivery work. The benchmark drains
+each object's reader with `io.Copy(io.Discard, reader)` — the same path a real
+consumer would drive.
+
 `CPU%` is normalized to "% of all cores" (100% = every vCPU saturated), matching
 the JS convention.
 
 ## Feature status (parity with the JS runner)
 
 - [x] Upload benchmark (multipart PUT) with abort-on-error cleanup
-- [x] Ordered-stream delivery + buffer pool (`download.orderedDelivery`)
+- [x] Ordered-stream delivery as a consumable `io.Reader`/`io.WriterTo` (`deliveryMode: ordered-stream`)
 - [x] Per-part timing percentiles (p50/p90/p99/p99.9) + front-end IP / conn-reuse capture
 - [x] Time-series RSS/CPU/in-flight sampling + SVG plot
 - [x] Stall watchdog + per-part retry
