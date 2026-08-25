@@ -7,6 +7,7 @@
 // Usage:
 //
 //	go run ./cmd/tmbench -mode download
+//	go run ./cmd/tmbench -mode download -download-api download-object   # WriterAt, parallel
 //	go run ./cmd/tmbench -mode upload -concurrency 128 -label tm-baseline
 //	go run ./cmd/tmbench -mode both
 package main
@@ -45,16 +46,17 @@ func main() {
 	partSize := flag.String("part-size", "", "Transfer Manager part size, e.g. 32MiB (empty = config partSize)")
 	maxBuffered := flag.String("max-buffered", "", "GetObject read-ahead buffer, e.g. 64GiB (empty = config maxBufferedBytes)")
 	prefix := flag.String("prefix", "tm-upload/", "key prefix for uploaded objects")
+	downloadAPI := flag.String("download-api", "get", "TM download API: get (GetObject stream) | download-object (DownloadObject WriterAt, parallel)")
 	progress := flag.Bool("progress", true, "print a live progress indicator to stderr")
 	flag.Parse()
 
-	if err := run(*cfgPath, *mode, *region, *bucket, *label, *concurrency, *objectConc, *partSize, *maxBuffered, *prefix, *progress); err != nil {
+	if err := run(*cfgPath, *mode, *region, *bucket, *label, *concurrency, *objectConc, *partSize, *maxBuffered, *prefix, *downloadAPI, *progress); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc int, partSize, maxBuffered, prefix string, progress bool) error {
+func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc int, partSize, maxBuffered, prefix, downloadAPI string, progress bool) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
@@ -86,6 +88,11 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 	case "upload", "download", "both":
 	default:
 		return fmt.Errorf("unknown mode %q (supported: upload, download, both)", mode)
+	}
+	switch downloadAPI {
+	case "get", "download-object":
+	default:
+		return fmt.Errorf("unknown -download-api %q (want get | download-object)", downloadAPI)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -131,14 +138,16 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 			o.PartSizeBytes = tmPartSize
 		}
 	})
-	if cfg.Download.MaxBufferedBytes > 0 && mode != "upload" {
+	// GetObjectBufferSize only applies to the GetObject (streaming) download API;
+	// DownloadObject writes parts to offsets and has no such read-ahead budget.
+	if cfg.Download.MaxBufferedBytes > 0 && mode != "upload" && downloadAPI == "get" {
 		fmt.Printf("tm read-ahead: total-budget=%s across %d objects -> %s/object (%d parts/object)\n\n",
 			humanBytes(cfg.Download.MaxBufferedBytes), dlObjConc, humanBytes(dlGetBuffer), dlGetBuffer/max64(tmPartSize, 1))
 	}
 
 	// "both" runs upload first, then download — each sampled and reported
 	// independently so the numbers never mix.
-	phases := phasesFor(mode, ctx, tm, cfg, prefix, upObjConc, upPerObjConc, dlObjConc, dlPerObjConc, dlGetBuffer)
+	phases := phasesFor(mode, ctx, tm, cfg, prefix, downloadAPI, upObjConc, upPerObjConc, dlObjConc, dlPerObjConc, dlGetBuffer)
 
 	startedAt := time.Now()
 	var runs []*bench.RunResult
@@ -194,12 +203,15 @@ type phase struct {
 // phasesFor expands a mode into ordered phases. "both" is upload then download.
 // Upload and download carry their own (object, per-object) concurrency, resolved
 // per config section.
-func phasesFor(mode string, ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prefix string,
+func phasesFor(mode string, ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prefix, downloadAPI string,
 	upObjConc, upPerObjConc, dlObjConc, dlPerObjConc int, dlGetBuffer int64) []phase {
 	upload := phase{"tm-upload", func(p *metrics.Progress) (*bench.RunResult, error) {
 		return tmbench.RunUpload(ctx, tm, cfg, p, prefix, upObjConc, upPerObjConc)
 	}}
 	download := phase{"tm-download", func(p *metrics.Progress) (*bench.RunResult, error) {
+		if downloadAPI == "download-object" {
+			return tmbench.RunDownloadObject(ctx, tm, cfg, p, dlObjConc, dlPerObjConc)
+		}
 		return tmbench.RunDownload(ctx, tm, cfg, p, dlObjConc, dlPerObjConc, dlGetBuffer)
 	}}
 	switch mode {

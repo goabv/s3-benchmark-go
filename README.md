@@ -106,6 +106,27 @@ On EC2: `./scripts/tm-run.sh both [label]` (extra flags pass through, e.g.
 `./scripts/tm-run.sh download lbl -concurrency 64`). `-part-size` defaults to config
 `partSize`; `-prefix` is the upload key prefix (default `tm-upload/`).
 
+**Two download APIs (`-download-api`, default `get`):** the TM offers two ways to
+download, and `tmbench` can exercise either:
+
+- `get` (default) — `GetObject`, which returns one ordered `io.Reader` per object.
+  Parts are fetched concurrently but delivered strictly in order through a single
+  reader, bounded by `GetObjectBufferSize` (the read-ahead note above). This is the
+  streaming API.
+- `download-object` — `DownloadObject`, which writes each object's parts to an
+  `io.WriterAt` at their byte offsets, fully in parallel with no single-reader
+  funnel and no read-ahead budget. `tmbench` uses a discarding `WriterAt` (bytes are
+  counted, then dropped), so it measures the TM's parallel-write ceiling — the
+  closest TM analog to the custom runner's `discard`/`file` modes.
+
+```sh
+go run ./cmd/tmbench -mode download -download-api download-object
+./scripts/tm-run.sh download tm-dlobj -download-api download-object
+```
+
+Both produce the same `tm-download-sweep.json` output; only the SDK code path
+differs. `-download-api` has no effect on upload.
+
 **Download read-ahead (important):** the TM's `GetObject` reader only fetches
 `GetObjectBufferSize / partSize` parts ahead of the consumer, and
 `GetObjectBufferSize` defaults to just **50 MiB** — so with 32 MiB parts it fetches

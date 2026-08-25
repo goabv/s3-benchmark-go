@@ -69,6 +69,24 @@ func (w progSink) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// discardWriterAt is an io.WriterAt that discards data while counting bytes into
+// prog (for live sampling) and its own total. The Transfer Manager's
+// DownloadObject writes parts concurrently at their byte offsets, so WriteAt must
+// be safe for concurrent calls — the atomic counters make it so, and offsets are
+// ignored since the sink is a bit bucket.
+type discardWriterAt struct {
+	prog  *metrics.Progress
+	total int64
+}
+
+func (w *discardWriterAt) WriteAt(p []byte, _ int64) (int, error) {
+	atomic.AddInt64(&w.total, int64(len(p)))
+	if w.prog != nil {
+		atomic.AddInt64(&w.prog.Bytes, int64(len(p)))
+	}
+	return len(p), nil
+}
+
 // RunUpload uploads `count` in-memory objects per size group via the Transfer
 // Manager's UploadObject (which multiparts automatically). Objects transfer
 // concurrently through a pool of objectConcurrency; each object's parts run at
@@ -183,6 +201,64 @@ func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Co
 					return fmt.Errorf("drain %q: %w", key, ce)
 				}
 				atomic.AddInt64(&bytes, n)
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			if it >= cfg.Download.Warmup {
+				samples = append(samples, sample3(bytes, time.Since(start)))
+			}
+		}
+
+		result.Groups = append(result.Groups, group(spec, perFileSize, len(keys), 0, objectConcurrency, perObjectConcurrency, samples, cfg.Download.ValidateChecksum))
+	}
+	return result, nil
+}
+
+// RunDownloadObject downloads the seeded objects (dataPrefix keys) per size group
+// via the Transfer Manager's DownloadObject, which writes each object's parts to an
+// io.WriterAt at their byte offsets fully in parallel — no single ordered-reader
+// funnel and no GetObjectBufferSize read-ahead. The sink is a discarding WriterAt
+// (bytes are counted for throughput, then dropped), so this measures the TM's
+// parallel-write ceiling. Objects transfer concurrently through a pool of
+// objectConcurrency; each object's parts run at perObjectConcurrency.
+func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prog *metrics.Progress, objectConcurrency, perObjectConcurrency int) (*bench.RunResult, error) {
+	if prog == nil {
+		prog = &metrics.Progress{}
+	}
+
+	fmt.Printf("=== S3 Transfer Manager DOWNLOAD benchmark (DownloadObject, WriterAt) ===\n")
+	fmt.Printf("region=%s  bucket=%s  sink=memory(discard WriterAt, parallel offsets)\n", cfg.Region, cfg.Bucket)
+	fmt.Printf("object-concurrency=%d  per-object part-concurrency=%d  ~parts-in-flight=%d  iterations=%d (warmup=%d)\n\n",
+		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, cfg.Download.Iterations, cfg.Download.Warmup)
+
+	result := &bench.RunResult{Mode: "tm-download"}
+	for _, spec := range cfg.Sizes {
+		keys := cfg.KeysFor(spec)
+		perFileSize, _ := config.ParseSize(spec.Size)
+
+		var samples []bench.Sample3
+		iters := cfg.Download.Warmup + cfg.Download.Iterations
+		for it := 0; it < iters; it++ {
+			var bytes int64
+			start := time.Now()
+			err := runObjectsParallel(ctx, objectConcurrency, len(keys), func(i int) error {
+				key := keys[i]
+				atomic.AddInt64(&prog.InFlight, 1)
+				defer atomic.AddInt64(&prog.InFlight, -1)
+				dw := &discardWriterAt{prog: prog}
+				_, e := tm.DownloadObject(ctx, &transfermanager.DownloadObjectInput{
+					Bucket:   aws.String(cfg.Bucket),
+					Key:      aws.String(key),
+					WriterAt: dw,
+				}, func(o *transfermanager.Options) {
+					o.Concurrency = perObjectConcurrency
+				})
+				if e != nil {
+					return fmt.Errorf("DownloadObject %q: %w", key, e)
+				}
+				atomic.AddInt64(&bytes, atomic.LoadInt64(&dw.total))
 				return nil
 			})
 			if err != nil {
