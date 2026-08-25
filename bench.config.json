@@ -11,11 +11,11 @@
     "workers": 64,
     "concurrency": 8,
     "iterations": 1,
-    "warmup": 1,
+    "warmup": 0,
     "validateChecksum": true,
     "spreadConnections": true,
     "tls": true,
-    "deliveryMode": "discard",
+    "deliveryMode": "ordered-stream",
     "deliveryPath": "/tmp",
     "maxBufferedBytes": 68719476736,
     "maxRetries": 2,
@@ -30,6 +30,30 @@
     "keyPrefix": "bench-upload/",
     "maxRetries": 2,
     "stallTimeoutMs": 30000
+  },
+
+  "transferManager": {
+    "download": {
+      "api": "download-object",
+      "getObjectType": "parts",
+      "sink": "discard",
+      "deliveryPath": "/tmp",
+      "objectConcurrency": 0,
+      "concurrency": 64,
+      "iterations": 1,
+      "warmup": 0,
+      "validateChecksum": true,
+      "maxBufferedBytes": 68719476736,
+      "stallTimeoutMs": 30000
+    },
+    "upload": {
+      "objectConcurrency": 0,
+      "concurrency": 8,
+      "iterations": 1,
+      "warmup": 0,
+      "keyPrefix": "tm-upload/",
+      "stallTimeoutMs": 30000
+    }
   },
 
   "sampling": {

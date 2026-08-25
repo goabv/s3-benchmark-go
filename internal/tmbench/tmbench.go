@@ -139,7 +139,7 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 	fmt.Printf("=== S3 Transfer Manager UPLOAD benchmark (feature/s3/transfermanager) ===\n")
 	fmt.Printf("region=%s  bucket=%s  keyPrefix=%s  source=memory\n", cfg.Region, cfg.Bucket, keyPrefix)
 	fmt.Printf("object-concurrency=%d  per-object part-concurrency=%d  ~parts-in-flight=%d  iterations=%d (warmup=%d)\n\n",
-		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, cfg.Upload.Iterations, cfg.Upload.Warmup)
+		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, cfg.TransferManager.Upload.Iterations, cfg.TransferManager.Upload.Warmup)
 
 	result := &bench.RunResult{Mode: "tm-upload"}
 	for _, spec := range cfg.Sizes {
@@ -153,7 +153,7 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 		}
 
 		var samples []bench.Sample3
-		iters := cfg.Upload.Warmup + cfg.Upload.Iterations
+		iters := cfg.TransferManager.Upload.Warmup + cfg.TransferManager.Upload.Iterations
 		for it := 0; it < iters; it++ {
 			var bytes int64
 			start := time.Now()
@@ -177,7 +177,7 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 			if err != nil {
 				return nil, err
 			}
-			if it >= cfg.Upload.Warmup {
+			if it >= cfg.TransferManager.Upload.Warmup {
 				samples = append(samples, sample3(bytes, time.Since(start)))
 			}
 		}
@@ -200,7 +200,7 @@ func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Co
 	fmt.Printf("=== S3 Transfer Manager DOWNLOAD benchmark (feature/s3/transfermanager) ===\n")
 	fmt.Printf("region=%s  bucket=%s  sink=memory(discard)  get-object-type=%s\n", cfg.Region, cfg.Bucket, getObjType)
 	fmt.Printf("object-concurrency=%d  per-object part-concurrency=%d  ~parts-in-flight=%d  iterations=%d (warmup=%d)\n\n",
-		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, cfg.Download.Iterations, cfg.Download.Warmup)
+		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, cfg.TransferManager.Download.Iterations, cfg.TransferManager.Download.Warmup)
 
 	result := &bench.RunResult{Mode: "tm-download"}
 	for _, spec := range cfg.Sizes {
@@ -208,7 +208,7 @@ func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Co
 		perFileSize, _ := config.ParseSize(spec.Size)
 
 		var samples []bench.Sample3
-		iters := cfg.Download.Warmup + cfg.Download.Iterations
+		iters := cfg.TransferManager.Download.Warmup + cfg.TransferManager.Download.Iterations
 		for it := 0; it < iters; it++ {
 			var bytes int64
 			start := time.Now()
@@ -221,6 +221,7 @@ func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Co
 					Key:    aws.String(key),
 				}, func(o *transfermanager.Options) {
 					o.Concurrency = perObjectConcurrency
+					o.DisableChecksumValidation = !cfg.TransferManager.Download.ValidateChecksum
 					if getObjType != "" {
 						o.GetObjectType = getObjType
 					}
@@ -244,12 +245,12 @@ func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Co
 			if err != nil {
 				return nil, err
 			}
-			if it >= cfg.Download.Warmup {
+			if it >= cfg.TransferManager.Download.Warmup {
 				samples = append(samples, sample3(bytes, time.Since(start)))
 			}
 		}
 
-		result.Groups = append(result.Groups, group(spec, perFileSize, len(keys), 0, objectConcurrency, perObjectConcurrency, samples, cfg.Download.ValidateChecksum))
+		result.Groups = append(result.Groups, group(spec, perFileSize, len(keys), 0, objectConcurrency, perObjectConcurrency, samples, cfg.TransferManager.Download.ValidateChecksum))
 	}
 	return result, nil
 }
@@ -280,7 +281,7 @@ func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *con
 	fmt.Printf("=== S3 Transfer Manager DOWNLOAD benchmark (DownloadObject, WriterAt) ===\n")
 	fmt.Printf("region=%s  bucket=%s  sink=%s  get-object-type=%s\n", cfg.Region, cfg.Bucket, sinkDesc, getObjType)
 	fmt.Printf("object-concurrency=%d  per-object part-concurrency=%d  ~parts-in-flight=%d  iterations=%d (warmup=%d)\n\n",
-		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, cfg.Download.Iterations, cfg.Download.Warmup)
+		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, cfg.TransferManager.Download.Iterations, cfg.TransferManager.Download.Warmup)
 
 	result := &bench.RunResult{Mode: "tm-download"}
 	for _, spec := range cfg.Sizes {
@@ -288,7 +289,7 @@ func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *con
 		perFileSize, _ := config.ParseSize(spec.Size)
 
 		var samples []bench.Sample3
-		iters := cfg.Download.Warmup + cfg.Download.Iterations
+		iters := cfg.TransferManager.Download.Warmup + cfg.TransferManager.Download.Iterations
 		for it := 0; it < iters; it++ {
 			var bytes int64
 			start := time.Now()
@@ -318,6 +319,7 @@ func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *con
 					WriterAt: w,
 				}, func(o *transfermanager.Options) {
 					o.Concurrency = perObjectConcurrency
+					o.DisableChecksumValidation = !cfg.TransferManager.Download.ValidateChecksum
 					if getObjType != "" {
 						o.GetObjectType = getObjType
 					}
@@ -331,12 +333,12 @@ func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *con
 			if err != nil {
 				return nil, err
 			}
-			if it >= cfg.Download.Warmup {
+			if it >= cfg.TransferManager.Download.Warmup {
 				samples = append(samples, sample3(bytes, time.Since(start)))
 			}
 		}
 
-		result.Groups = append(result.Groups, group(spec, perFileSize, len(keys), 0, objectConcurrency, perObjectConcurrency, samples, cfg.Download.ValidateChecksum))
+		result.Groups = append(result.Groups, group(spec, perFileSize, len(keys), 0, objectConcurrency, perObjectConcurrency, samples, cfg.TransferManager.Download.ValidateChecksum))
 	}
 	return result, nil
 }

@@ -65,6 +65,51 @@ func (u Upload) Parallelism() int {
 	return p
 }
 
+// TMDownload holds the Transfer Manager (v2 baseline) download knobs, expressed
+// directly rather than derived from a workers x concurrency product. Consumed by
+// cmd/tmbench; the optimized/custom runner (cmd/bench) uses Download instead.
+type TMDownload struct {
+	API               string `json:"api"`               // "get" (GetObject stream) | "download-object" (WriterAt, parallel)
+	GetObjectType     string `json:"getObjectType"`     // "parts" (PartNumber) | "ranges" (byte ranges of partSize)
+	Sink              string `json:"sink"`              // "discard" | "file" (download-object only)
+	DeliveryPath      string `json:"deliveryPath"`      // directory for sink=file
+	ObjectConcurrency int    `json:"objectConcurrency"` // objects in parallel (0 = object count)
+	Concurrency       int    `json:"concurrency"`       // per-object part concurrency (0 = SDK default)
+	Iterations        int    `json:"iterations"`
+	Warmup            int    `json:"warmup"`
+	ValidateChecksum  bool   `json:"validateChecksum"`
+	MaxBufferedBytes  int64  `json:"maxBufferedBytes"` // GetObject read-ahead ("get" API only)
+	StallTimeoutMs    int    `json:"stallTimeoutMs"`
+}
+
+// StallTimeout returns the TM download stall-watchdog timeout.
+func (d TMDownload) StallTimeout() time.Duration {
+	return time.Duration(d.StallTimeoutMs) * time.Millisecond
+}
+
+// TMUpload holds the Transfer Manager (v2 baseline) upload knobs.
+type TMUpload struct {
+	ObjectConcurrency int    `json:"objectConcurrency"` // objects in parallel (0 = object count)
+	Concurrency       int    `json:"concurrency"`       // per-object part concurrency (0 = SDK default)
+	Iterations        int    `json:"iterations"`
+	Warmup            int    `json:"warmup"`
+	KeyPrefix         string `json:"keyPrefix"`
+	StallTimeoutMs    int    `json:"stallTimeoutMs"`
+}
+
+// StallTimeout returns the TM upload stall-watchdog timeout.
+func (u TMUpload) StallTimeout() time.Duration {
+	return time.Duration(u.StallTimeoutMs) * time.Millisecond
+}
+
+// TransferManager is the TM v2 baseline section (cmd/tmbench), kept separate from
+// the optimized custom runner's Download/Upload sections so the two never share
+// meaning. Concurrency is set directly here rather than derived.
+type TransferManager struct {
+	Download TMDownload `json:"download"`
+	Upload   TMUpload   `json:"upload"`
+}
+
 // Sampling controls the background time-series resource sampler.
 type Sampling struct {
 	Enabled    bool `json:"enabled"`
@@ -83,17 +128,18 @@ type Results struct {
 
 // Config is the whole bench.config.json.
 type Config struct {
-	Bucket     string     `json:"bucket"`
-	Region     string     `json:"region"`
-	DataPrefix string     `json:"dataPrefix"`
-	CodePrefix string     `json:"codePrefix"`
-	Sizes      []SizeSpec `json:"sizes"`
-	PartSize   string     `json:"partSize"`
-	Checksum   string     `json:"checksum"`
-	Download   Download   `json:"download"`
-	Upload     Upload     `json:"upload"`
-	Sampling   Sampling   `json:"sampling"`
-	Results    Results    `json:"results"`
+	Bucket          string          `json:"bucket"`
+	Region          string          `json:"region"`
+	DataPrefix      string          `json:"dataPrefix"`
+	CodePrefix      string          `json:"codePrefix"`
+	Sizes           []SizeSpec      `json:"sizes"`
+	PartSize        string          `json:"partSize"`
+	Checksum        string          `json:"checksum"`
+	Download        Download        `json:"download"`
+	Upload          Upload          `json:"upload"`
+	TransferManager TransferManager `json:"transferManager"`
+	Sampling        Sampling        `json:"sampling"`
+	Results         Results         `json:"results"`
 }
 
 // Load reads and parses a bench.config.json file.
@@ -157,6 +203,39 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Upload.KeyPrefix == "" {
 		c.Upload.KeyPrefix = "bench-upload/"
+	}
+
+	// Transfer Manager (v2 baseline) defaults. ObjectConcurrency/Concurrency stay
+	// 0 = "auto" and are resolved by cmd/tmbench (0 objects -> object count; 0
+	// per-object -> SDK default).
+	tmd := &c.TransferManager.Download
+	if tmd.API == "" {
+		tmd.API = "get"
+	}
+	if tmd.GetObjectType == "" {
+		tmd.GetObjectType = "parts"
+	}
+	if tmd.Sink == "" {
+		tmd.Sink = "discard"
+	}
+	if tmd.DeliveryPath == "" {
+		tmd.DeliveryPath = os.TempDir()
+	}
+	if tmd.Iterations <= 0 {
+		tmd.Iterations = 1
+	}
+	if tmd.StallTimeoutMs <= 0 {
+		tmd.StallTimeoutMs = 30000
+	}
+	tmu := &c.TransferManager.Upload
+	if tmu.Iterations <= 0 {
+		tmu.Iterations = 1
+	}
+	if tmu.KeyPrefix == "" {
+		tmu.KeyPrefix = "tm-upload/"
+	}
+	if tmu.StallTimeoutMs <= 0 {
+		tmu.StallTimeoutMs = 30000
 	}
 
 	if c.Sampling.IntervalMs <= 0 {

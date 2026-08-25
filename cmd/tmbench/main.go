@@ -4,14 +4,17 @@
 // drains GetObject bodies to io.Discard. It targets the same seeded objects as
 // the main benchmark and captures results into results/runs/ for comparison.
 //
+// All Transfer Manager knobs (api, sink, deliveryPath, getObjectType,
+// objectConcurrency, concurrency, iterations, warmup, validateChecksum,
+// maxBufferedBytes) live in bench.config.json under "transferManager". The flags
+// below are optional per-run overrides (empty/0 = use the config value); -mode
+// selects what to run.
+//
 // Usage:
 //
-//	go run ./cmd/tmbench -mode download
-//	go run ./cmd/tmbench -mode download -download-api download-object   # WriterAt, parallel (discard)
-//	go run ./cmd/tmbench -mode download -download-api download-object -download-sink file -delivery-path /mnt/scratch
-//	go run ./cmd/tmbench -mode download -download-api download-object -get-object-type ranges -part-size 32MiB
-//	go run ./cmd/tmbench -mode upload -concurrency 128 -label tm-baseline
-//	go run ./cmd/tmbench -mode both
+//	go run ./cmd/tmbench -mode download                 # uses transferManager config
+//	go run ./cmd/tmbench -mode both -label tm-baseline
+//	go run ./cmd/tmbench -mode download -concurrency 128 -get-object-type ranges  # one-off overrides
 package main
 
 import (
@@ -44,15 +47,17 @@ func main() {
 	region := flag.String("region", "", "override region")
 	bucket := flag.String("bucket", "", "override bucket")
 	label := flag.String("label", "", "optional run label (appended to the run directory name)")
-	concurrency := flag.Int("concurrency", 0, "TM part concurrency per object (0 = auto: total/object-concurrency)")
-	objectConc := flag.Int("object-concurrency", 0, "objects transferred in parallel (0 = auto: object count)")
-	partSize := flag.String("part-size", "", "Transfer Manager part size, e.g. 32MiB (empty = config partSize)")
-	maxBuffered := flag.String("max-buffered", "", "GetObject read-ahead buffer, e.g. 64GiB (empty = config maxBufferedBytes)")
-	prefix := flag.String("prefix", "tm-upload/", "key prefix for uploaded objects")
-	downloadAPI := flag.String("download-api", "get", "TM download API: get (GetObject stream) | download-object (DownloadObject WriterAt, parallel)")
-	downloadSink := flag.String("download-sink", "discard", "download-object sink: discard (WriterAt bit-bucket) | file (WriterAt -> *os.File under -delivery-path)")
-	deliveryPath := flag.String("delivery-path", "", "directory for -download-sink file (empty = config download.deliveryPath)")
-	getObjectType := flag.String("get-object-type", "parts", "TM multipart download strategy: parts (PartNumber, follows upload boundaries) | ranges (byte ranges of part-size)")
+	// All TM knobs live in bench.config.json under "transferManager". These flags
+	// are optional per-run overrides: empty string / 0 means "use the config value".
+	concurrency := flag.Int("concurrency", 0, "override per-object part concurrency (0 = config transferManager.*.concurrency)")
+	objectConc := flag.Int("object-concurrency", 0, "override objects in parallel (0 = config transferManager.*.objectConcurrency)")
+	partSize := flag.String("part-size", "", "override part size, e.g. 32MiB (empty = config partSize)")
+	maxBuffered := flag.String("max-buffered", "", "override GetObject read-ahead, e.g. 64GiB (empty = config transferManager.download.maxBufferedBytes)")
+	prefix := flag.String("prefix", "", "override upload key prefix (empty = config transferManager.upload.keyPrefix)")
+	downloadAPI := flag.String("download-api", "", "override TM download API: get | download-object (empty = config transferManager.download.api)")
+	downloadSink := flag.String("download-sink", "", "override download-object sink: discard | file (empty = config transferManager.download.sink)")
+	deliveryPath := flag.String("delivery-path", "", "override sink=file directory (empty = config transferManager.download.deliveryPath)")
+	getObjectType := flag.String("get-object-type", "", "override TM download strategy: parts | ranges (empty = config transferManager.download.getObjectType)")
 	progress := flag.Bool("progress", true, "print a live progress indicator to stderr")
 	flag.Parse()
 
@@ -76,12 +81,33 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 	if partSize != "" {
 		cfg.PartSize = partSize
 	}
+
+	// The transferManager section is the source of truth; flags override in place
+	// (empty/0 = keep the config value), so the captured report reflects what ran.
+	tmd := &cfg.TransferManager.Download
+	tmu := &cfg.TransferManager.Upload
 	if maxBuffered != "" {
 		n, err := config.ParseSize(maxBuffered)
 		if err != nil {
 			return fmt.Errorf("parse -max-buffered %q: %w", maxBuffered, err)
 		}
-		cfg.Download.MaxBufferedBytes = n
+		tmd.MaxBufferedBytes = n
+	}
+	if downloadAPI != "" {
+		tmd.API = downloadAPI
+	}
+	if downloadSink != "" {
+		tmd.Sink = downloadSink
+	}
+	if getObjectType != "" {
+		tmd.GetObjectType = getObjectType
+	}
+	if deliveryPath != "" {
+		tmd.DeliveryPath = deliveryPath
+	}
+	upKeyPrefix := tmu.KeyPrefix
+	if prefix != "" {
+		upKeyPrefix = prefix
 	}
 
 	// Bound RSS so a large GetObject read-ahead buffer can't get the process
@@ -95,34 +121,27 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 	default:
 		return fmt.Errorf("unknown mode %q (supported: upload, download, both)", mode)
 	}
-	switch downloadAPI {
+	switch tmd.API {
 	case "get", "download-object":
 	default:
-		return fmt.Errorf("unknown -download-api %q (want get | download-object)", downloadAPI)
+		return fmt.Errorf("unknown transferManager.download.api %q (want get | download-object)", tmd.API)
 	}
-	switch downloadSink {
+	switch tmd.Sink {
 	case "discard", "file":
 	default:
-		return fmt.Errorf("unknown -download-sink %q (want discard | file)", downloadSink)
+		return fmt.Errorf("unknown transferManager.download.sink %q (want discard | file)", tmd.Sink)
 	}
-	if downloadSink == "file" && downloadAPI != "download-object" {
-		return fmt.Errorf("-download-sink file requires -download-api download-object")
+	if tmd.Sink == "file" && tmd.API != "download-object" {
+		return fmt.Errorf("transferManager.download.sink=file requires api=download-object")
 	}
-	// Map -get-object-type to the TM's multipart download strategy. Default
-	// "parts" matches the SDK default (types.GetObjectParts).
 	var tmGetObjType types.GetObjectType
-	switch getObjectType {
+	switch tmd.GetObjectType {
 	case "parts":
 		tmGetObjType = types.GetObjectParts
 	case "ranges":
 		tmGetObjType = types.GetObjectRanges
 	default:
-		return fmt.Errorf("unknown -get-object-type %q (want parts | ranges)", getObjectType)
-	}
-	// Resolve the file sink directory (flag overrides config download.deliveryPath).
-	dlPath := deliveryPath
-	if dlPath == "" {
-		dlPath = cfg.Download.DeliveryPath
+		return fmt.Errorf("unknown transferManager.download.getObjectType %q (want parts | ranges)", tmd.GetObjectType)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -133,16 +152,17 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 		return err
 	}
 
-	// Resolve the two parallelism dimensions PER PHASE so upload reads the upload
-	// section and download reads the download section (the -object-concurrency /
-	// -concurrency flags, when set, override both). Total parts in flight defaults
-	// to that section's workers x concurrency for an apples-to-apples comparison.
+	// Resolve the two parallelism dimensions directly from the transferManager
+	// config; -object-concurrency / -concurrency override when > 0. objectConc 0 =
+	// object count; per-object concurrency 0 = the SDK default.
 	maxObj := maxObjectCount(cfg)
-	upObjConc, upPerObjConc := resolvePhase(cfg.Upload.Parallelism(), objectConc, concurrency, maxObj)
-	dlObjConc, dlPerObjConc := resolvePhase(cfg.Download.Parallelism(), objectConc, concurrency, maxObj)
-	// GetObject read-ahead is a TOTAL budget (download.maxBufferedBytes, matching
-	// the JS runner) split across the concurrent objects.
-	dlGetBuffer := resolveGetBuffer(cfg.Download.MaxBufferedBytes, dlObjConc, dlPerObjConc, tmPartSize)
+	dlObjConc := resolveObjConc(objectConc, tmd.ObjectConcurrency, maxObj)
+	dlPerObjConc := resolvePerObjConc(concurrency, tmd.Concurrency)
+	upObjConc := resolveObjConc(objectConc, tmu.ObjectConcurrency, maxObj)
+	upPerObjConc := resolvePerObjConc(concurrency, tmu.Concurrency)
+	// GetObject read-ahead is a TOTAL budget (transferManager.download.maxBufferedBytes)
+	// split across the concurrent objects.
+	dlGetBuffer := resolveGetBuffer(tmd.MaxBufferedBytes, dlObjConc, dlPerObjConc, tmPartSize)
 
 	// Size the keep-alive transport to the larger phase's total parts in flight.
 	maxConns := upObjConc * upPerObjConc
@@ -170,14 +190,14 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 	})
 	// GetObjectBufferSize only applies to the GetObject (streaming) download API;
 	// DownloadObject writes parts to offsets and has no such read-ahead budget.
-	if cfg.Download.MaxBufferedBytes > 0 && mode != "upload" && downloadAPI == "get" {
+	if tmd.MaxBufferedBytes > 0 && mode != "upload" && tmd.API == "get" {
 		fmt.Printf("tm read-ahead: total-budget=%s across %d objects -> %s/object (%d parts/object)\n\n",
-			humanBytes(cfg.Download.MaxBufferedBytes), dlObjConc, humanBytes(dlGetBuffer), dlGetBuffer/max64(tmPartSize, 1))
+			humanBytes(tmd.MaxBufferedBytes), dlObjConc, humanBytes(dlGetBuffer), dlGetBuffer/max64(tmPartSize, 1))
 	}
 
 	// "both" runs upload first, then download — each sampled and reported
 	// independently so the numbers never mix.
-	phases := phasesFor(mode, ctx, tm, cfg, prefix, downloadAPI, downloadSink, dlPath, tmGetObjType, upObjConc, upPerObjConc, dlObjConc, dlPerObjConc, dlGetBuffer)
+	phases := phasesFor(mode, ctx, tm, cfg, upKeyPrefix, tmd.API, tmd.Sink, tmd.DeliveryPath, tmGetObjType, upObjConc, upPerObjConc, dlObjConc, dlPerObjConc, dlGetBuffer)
 
 	startedAt := time.Now()
 	var runs []*bench.RunResult
@@ -265,9 +285,9 @@ func runPhase(ctx context.Context, cfg *config.Config, ph phase, progress bool) 
 		sampler = metrics.NewSampler(cfg.Sampling.SampleInterval(), prog)
 		sampler.Start()
 	}
-	stall := cfg.Download.StallTimeout()
+	stall := cfg.TransferManager.Download.StallTimeout()
 	if ph.name == "tm-upload" {
-		stall = cfg.Upload.StallTimeout()
+		stall = cfg.TransferManager.Upload.StallTimeout()
 	}
 	wd := metrics.NewWatchdog(stall, prog)
 	wd.Start(ctx)
@@ -351,26 +371,39 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
-// resolvePhase derives (objectConcurrency, perObjectConcurrency) for a phase.
-// The flags (objFlag/concFlag) override when > 0; otherwise object-concurrency
-// defaults to the object count and per-object-concurrency to total/objects so the
-// total parts in flight matches that section's workers x concurrency.
-func resolvePhase(total, objFlag, concFlag, maxObjects int) (objectConc, perObjectConc int) {
-	objectConc = objFlag
-	if objectConc <= 0 {
-		objectConc = maxObjects
+// defaultTMConcurrency mirrors the Transfer Manager's own default per-object
+// concurrency (feature/s3/transfermanager defaultTransferConcurrency), used when
+// neither the config nor the -concurrency flag sets one.
+const defaultTMConcurrency = 5
+
+// resolveObjConc picks the number of objects to transfer in parallel: the
+// -object-concurrency flag when > 0, else the config value, else the object count.
+func resolveObjConc(flagVal, cfgVal, objCount int) int {
+	v := cfgVal
+	if flagVal > 0 {
+		v = flagVal
 	}
-	if objectConc < 1 {
-		objectConc = 1
+	if v <= 0 {
+		v = objCount
 	}
-	perObjectConc = concFlag
-	if perObjectConc <= 0 {
-		perObjectConc = total / objectConc
-		if perObjectConc < 1 {
-			perObjectConc = 1
-		}
+	if v < 1 {
+		v = 1
 	}
-	return objectConc, perObjectConc
+	return v
+}
+
+// resolvePerObjConc picks the per-object part concurrency: the -concurrency flag
+// when > 0, else the config value, else the SDK default. Always concrete so the
+// header and maxConns sizing are meaningful.
+func resolvePerObjConc(flagVal, cfgVal int) int {
+	v := cfgVal
+	if flagVal > 0 {
+		v = flagVal
+	}
+	if v <= 0 {
+		v = defaultTMConcurrency
+	}
+	return v
 }
 
 // maxObjectCount returns the largest object count across configured size groups.

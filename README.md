@@ -71,12 +71,14 @@ EC2 instance role). On the benchmark EC2 host the instance role is used.
 
 A separate runner benchmarks the **latest AWS SDK for Go v2 S3 Transfer Manager**
 (`feature/s3/transfermanager`) as an out-of-the-box baseline, using its
-single-object `UploadObject` / `GetObject` operations with **fully in-memory**
-data — no local files:
+`UploadObject` and either `GetObject` (streaming) or `DownloadObject` (`WriterAt`)
+operations:
 
 - **upload** streams each object from a small repeating in-memory buffer (no
   whole-object allocation), letting the TM multipart it automatically
-- **download** drains each `GetObject` body straight to `io.Discard`
+- **download** either drains each `GetObject` body to a counting sink, or hands
+  `DownloadObject` an `io.WriterAt` — a discarding bit-bucket (`sink: discard`, the
+  default, in-memory) or a real file (`sink: file`, to disk)
 
 It targets the same seeded objects (same `bench.config.json`) as the main
 benchmark, and captures into the same `results/runs/` layout (`tm-upload-sweep.json`
@@ -84,97 +86,79 @@ benchmark, and captures into the same `results/runs/` layout (`tm-upload-sweep.j
 comparable.
 
 Both upload and download transfer **objects in parallel**, and each object's parts
-run at the TM's own concurrency. Total parts in flight is therefore
-`object-concurrency × per-object-concurrency`, which **defaults to the custom
-runner's `workers × concurrency`** so the two are comparable out of the box:
+run at the TM's own concurrency, so total parts in flight is
+`objectConcurrency × concurrency`.
 
-- `-object-concurrency` — objects transferred at once (default: the object count)
-- `-concurrency` — TM part concurrency per object (default: `target_total / object-concurrency`)
+All Transfer Manager knobs live in `bench.config.json` under a dedicated
+**`transferManager`** section — separate from the `download` / `upload` sections
+the custom (optimized) runner uses, so the two never share meaning. The config is
+the source of truth; the CLI flags below are optional per-run overrides (empty
+string / `0` = "use the config value").
 
-```sh
-go run ./cmd/tmbench -mode download                        # auto: ~workers*concurrency in flight
-go run ./cmd/tmbench -mode both -object-concurrency 10 -concurrency 25
-go run ./cmd/tmbench -mode upload -part-size 32MiB -label tm-baseline
+```json
+"transferManager": {
+  "download": {
+    "api": "download-object",        // get (GetObject stream) | download-object (WriterAt, parallel)
+    "getObjectType": "parts",        // parts (PartNumber) | ranges (byte ranges of partSize)
+    "sink": "discard",               // discard (bit-bucket) | file (*os.File under deliveryPath)
+    "deliveryPath": "/tmp",          // directory for sink=file
+    "objectConcurrency": 0,          // objects in parallel (0 = object count)
+    "concurrency": 64,               // per-object part concurrency (0 = SDK default, 5)
+    "iterations": 1, "warmup": 0,
+    "validateChecksum": true,        // false -> DisableChecksumValidation (skip the CRC pass)
+    "maxBufferedBytes": 68719476736  // GetObject read-ahead total ("get" API only)
+  },
+  "upload": {
+    "objectConcurrency": 0, "concurrency": 8,
+    "iterations": 1, "warmup": 0, "keyPrefix": "tm-upload/"
+  }
+}
 ```
 
-For example, with the default config (10 objects, download `workers 64 × concurrency 4` = 256),
-`tmbench` defaults to `object-concurrency=10 × per-object-concurrency=25 ≈ 250` parts in
-flight — matching the custom runner. Set `-object-concurrency 1 -concurrency 256` to
-push all parallelism into a single object at a time instead.
+`partSize` stays top-level (shared with the custom runner). Both runners target the
+same seeded objects and capture into the same `results/runs/` layout
+(`tm-upload-sweep.json` / `tm-download-sweep.json`), so the TM baseline and the
+custom runner stay directly comparable.
 
-On EC2: `./scripts/tm-run.sh both [label]` (extra flags pass through, e.g.
-`./scripts/tm-run.sh download lbl -concurrency 64`). `-part-size` defaults to config
-`partSize`; `-prefix` is the upload key prefix (default `tm-upload/`).
+The knobs (each with a one-off `-flag` override):
 
-**Two download APIs (`-download-api`, default `get`):** the TM offers two ways to
-download, and `tmbench` can exercise either:
-
-- `get` (default) — `GetObject`, which returns one ordered `io.Reader` per object.
-  Parts are fetched concurrently but delivered strictly in order through a single
-  reader, bounded by `GetObjectBufferSize` (the read-ahead note above). This is the
-  streaming API.
-- `download-object` — `DownloadObject`, which writes each object's parts to an
-  `io.WriterAt` at their byte offsets, fully in parallel with no single-reader
-  funnel and no read-ahead budget. `tmbench` uses a discarding `WriterAt` (bytes are
-  counted, then dropped), so it measures the TM's parallel-write ceiling — the
-  closest TM analog to the custom runner's `discard`/`file` modes.
-
-```sh
-go run ./cmd/tmbench -mode download -download-api download-object
-./scripts/tm-run.sh download tm-dlobj -download-api download-object
-```
-
-Both produce the same `tm-download-sweep.json` output; only the SDK code path
-differs. `-download-api` has no effect on upload.
-
-**DownloadObject sink (`-download-sink`, default `discard`):** `DownloadObject`
-writes to whatever `io.WriterAt` it's given, so `tmbench` can point it at two sinks:
-
-- `discard` (default) — a bit-bucket `WriterAt` that counts bytes and drops them.
-  Measures the **network + SDK receive ceiling** (no storage cost).
-- `file` — a real `*os.File` per object under `-delivery-path` (defaults to config
-  `download.deliveryPath`). The SDK writes parts to disk at their offsets; each file
-  is removed after its object completes. Measures **download-to-disk** throughput,
-  which on EBS-only instances is bounded by EBS bandwidth, not the NIC.
+- **`api`** (`-download-api`) — `get` = `GetObject`, one ordered `io.Reader` per
+  object (parts fetched concurrently but delivered in order through a single reader,
+  bounded by `maxBufferedBytes`); `download-object` = `DownloadObject`, parts written
+  to an `io.WriterAt` at their offsets, fully parallel, no single-reader funnel.
+- **`sink`** (`-download-sink`, download-object only) — `discard` measures the
+  network + SDK receive ceiling; `file` writes a real `*os.File` per object under
+  `deliveryPath` (removed after each object) to measure download-to-disk, which on
+  EBS-only instances is EBS-bound, not NIC-bound.
+- **`getObjectType`** (`-get-object-type`) — `parts` fetches by PartNumber following
+  the object's *upload* boundaries (so `partSize` does **not** change download
+  chunking); `ranges` fetches byte ranges of `partSize`, always parallel. Printed in
+  the run header as `get-object-type=PART|RANGE`.
+- **`objectConcurrency` / `concurrency`** (`-object-concurrency` / `-concurrency`) —
+  objects in parallel and per-object part concurrency.
+- **`validateChecksum`** — `false` sets `DisableChecksumValidation` to skip the CRC
+  pass over every byte (isolates the network/disk ceiling from checksum CPU).
 
 ```sh
-# to-disk (requires -download-api download-object):
-./scripts/tm-run.sh download tm-dlobj-file -download-api download-object -download-sink file -delivery-path /mnt/scratch
+# config drives everything:
+./scripts/tm-run.sh download tm-dlobj
+./scripts/tm-run.sh both tm-baseline
+# one-off overrides without editing the config:
+./scripts/tm-run.sh download tm-ranges -get-object-type ranges -part-size 32MiB
+./scripts/tm-run.sh download tm-c128   -concurrency 128
 ```
 
-Disk-space warning: the file sink writes up to `object-concurrency × object-size`
-concurrently (e.g. 10 × 30 GiB = 300 GiB peak). Point `-delivery-path` at a volume
-with enough free space, or lower `-object-concurrency` / the configured sizes.
-`-download-sink file` requires `-download-api download-object` (there is no
-file sink for the `get` stream path).
-
-**Multipart download strategy (`-get-object-type`, default `parts`):** the TM
-supports two ways to split a download, applied to both download APIs. The default
-matches the SDK's own default (`GetObjectParts`):
-
-- `parts` (default) — fetch by **PartNumber**, following the object's *upload* part
-  boundaries. A first serial `GetObject(PartNumber=1)` learns the part count, then
-  parts `2..N` are fetched `concurrency`-at-a-time. Part size is fixed by how the
-  object was uploaded, so `-part-size` does **not** change download chunking here.
-  Requires a multipart object with >1 part, or there's nothing to parallelize.
-- `ranges` — ignore upload boundaries and fetch **byte ranges of `partSize`**
-  (config `partSize` / `-part-size`), always parallel regardless of how the object
-  was uploaded. This is the mode where part size is a download-side lever.
-
-```sh
-# compare strategies on the same object:
-./scripts/tm-run.sh download tm-parts  -download-api download-object -get-object-type parts
-./scripts/tm-run.sh download tm-ranges -download-api download-object -get-object-type ranges -part-size 32MiB
-```
-
-The resolved strategy is printed in the run header (`get-object-type=PART|RANGE`).
+Disk-space warning for `sink: file`: it writes up to `objectConcurrency × object-size`
+concurrently (e.g. 10 × 30 GiB = 300 GiB peak). Point `deliveryPath` at a volume with
+enough free space, or lower `objectConcurrency` / the configured sizes. `sink: file`
+requires `api: download-object`.
 
 **Download read-ahead (important):** the TM's `GetObject` reader only fetches
 `GetObjectBufferSize / partSize` parts ahead of the consumer, and
 `GetObjectBufferSize` defaults to just **50 MiB** — so with 32 MiB parts it fetches
 only ~1 part at a time regardless of `Concurrency`, which throttles download hard.
-`tmbench` drives `GetObjectBufferSize` from the `download.maxBufferedBytes` config
-key (default 64 GiB). Because `GetObjectBufferSize` is
+`tmbench` drives `GetObjectBufferSize` from the
+`transferManager.download.maxBufferedBytes` config key (default 64 GiB). Because `GetObjectBufferSize` is
 per-`GetObject`-call, that value is treated as a **total** budget and split across
 the objects in flight (`maxBufferedBytes / object-concurrency`, floored at one part
 per object), so peak read-ahead memory stays ≈ the configured total rather than
