@@ -36,8 +36,8 @@
     "download": {
       "api": "download-object",
       "getObjectType": "parts",
-      "sink": "discard",
-      "deliveryPath": "/tmp",
+      "sink": "file",
+      "deliveryPath": "/mnt/stripe",
       "objectConcurrency": 0,
       "concurrency": 64,
       "iterations": 1,
