@@ -16,6 +16,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -85,6 +87,38 @@ func (w *discardWriterAt) WriteAt(p []byte, _ int64) (int, error) {
 		atomic.AddInt64(&w.prog.Bytes, int64(len(p)))
 	}
 	return len(p), nil
+}
+
+func (w *discardWriterAt) written() int64 { return atomic.LoadInt64(&w.total) }
+
+// countingWriterAt wraps a real io.WriterAt (e.g. an *os.File) and counts the
+// bytes actually written into prog (live sampling) and its own total. Used for
+// the "file" download sink so DownloadObject writes to disk at part offsets while
+// we still measure throughput. Concurrency-safe as long as the wrapped WriterAt
+// is (an *os.File is, via positional pwrite).
+type countingWriterAt struct {
+	w     io.WriterAt
+	prog  *metrics.Progress
+	total int64
+}
+
+func (c *countingWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	n, err := c.w.WriteAt(p, off)
+	if n > 0 {
+		atomic.AddInt64(&c.total, int64(n))
+		if c.prog != nil {
+			atomic.AddInt64(&c.prog.Bytes, int64(n))
+		}
+	}
+	return n, err
+}
+
+func (c *countingWriterAt) written() int64 { return atomic.LoadInt64(&c.total) }
+
+// countingSink is a byte-counting io.WriterAt (discard or file-backed).
+type countingSink interface {
+	io.WriterAt
+	written() int64
 }
 
 // RunUpload uploads `count` in-memory objects per size group via the Transfer
@@ -223,13 +257,24 @@ func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Co
 // (bytes are counted for throughput, then dropped), so this measures the TM's
 // parallel-write ceiling. Objects transfer concurrently through a pool of
 // objectConcurrency; each object's parts run at perObjectConcurrency.
-func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prog *metrics.Progress, objectConcurrency, perObjectConcurrency int) (*bench.RunResult, error) {
+func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prog *metrics.Progress, objectConcurrency, perObjectConcurrency int, sink, deliveryPath string) (*bench.RunResult, error) {
 	if prog == nil {
 		prog = &metrics.Progress{}
 	}
+	toFile := sink == "file"
+	sinkDesc := "memory(discard WriterAt, parallel offsets)"
+	if toFile {
+		if deliveryPath == "" {
+			deliveryPath = "."
+		}
+		if err := os.MkdirAll(deliveryPath, 0o755); err != nil {
+			return nil, fmt.Errorf("create deliveryPath %q: %w", deliveryPath, err)
+		}
+		sinkDesc = fmt.Sprintf("disk (WriterAt -> *os.File under %s, removed after each object)", deliveryPath)
+	}
 
 	fmt.Printf("=== S3 Transfer Manager DOWNLOAD benchmark (DownloadObject, WriterAt) ===\n")
-	fmt.Printf("region=%s  bucket=%s  sink=memory(discard WriterAt, parallel offsets)\n", cfg.Region, cfg.Bucket)
+	fmt.Printf("region=%s  bucket=%s  sink=%s\n", cfg.Region, cfg.Bucket, sinkDesc)
 	fmt.Printf("object-concurrency=%d  per-object part-concurrency=%d  ~parts-in-flight=%d  iterations=%d (warmup=%d)\n\n",
 		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, cfg.Download.Iterations, cfg.Download.Warmup)
 
@@ -247,18 +292,33 @@ func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *con
 				key := keys[i]
 				atomic.AddInt64(&prog.InFlight, 1)
 				defer atomic.AddInt64(&prog.InFlight, -1)
-				dw := &discardWriterAt{prog: prog}
+
+				var w countingSink
+				cleanup := func() {}
+				if toFile {
+					path := filepath.Join(deliveryPath, sanitize(key))
+					f, ferr := os.Create(path)
+					if ferr != nil {
+						return fmt.Errorf("create %q: %w", path, ferr)
+					}
+					w = &countingWriterAt{w: f, prog: prog}
+					cleanup = func() { _ = f.Close(); _ = os.Remove(path) }
+				} else {
+					w = &discardWriterAt{prog: prog}
+				}
+				defer cleanup()
+
 				_, e := tm.DownloadObject(ctx, &transfermanager.DownloadObjectInput{
 					Bucket:   aws.String(cfg.Bucket),
 					Key:      aws.String(key),
-					WriterAt: dw,
+					WriterAt: w,
 				}, func(o *transfermanager.Options) {
 					o.Concurrency = perObjectConcurrency
 				})
 				if e != nil {
 					return fmt.Errorf("DownloadObject %q: %w", key, e)
 				}
-				atomic.AddInt64(&bytes, atomic.LoadInt64(&dw.total))
+				atomic.AddInt64(&bytes, w.written())
 				return nil
 			})
 			if err != nil {

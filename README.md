@@ -127,6 +127,27 @@ go run ./cmd/tmbench -mode download -download-api download-object
 Both produce the same `tm-download-sweep.json` output; only the SDK code path
 differs. `-download-api` has no effect on upload.
 
+**DownloadObject sink (`-download-sink`, default `discard`):** `DownloadObject`
+writes to whatever `io.WriterAt` it's given, so `tmbench` can point it at two sinks:
+
+- `discard` (default) — a bit-bucket `WriterAt` that counts bytes and drops them.
+  Measures the **network + SDK receive ceiling** (no storage cost).
+- `file` — a real `*os.File` per object under `-delivery-path` (defaults to config
+  `download.deliveryPath`). The SDK writes parts to disk at their offsets; each file
+  is removed after its object completes. Measures **download-to-disk** throughput,
+  which on EBS-only instances is bounded by EBS bandwidth, not the NIC.
+
+```sh
+# to-disk (requires -download-api download-object):
+./scripts/tm-run.sh download tm-dlobj-file -download-api download-object -download-sink file -delivery-path /mnt/scratch
+```
+
+Disk-space warning: the file sink writes up to `object-concurrency × object-size`
+concurrently (e.g. 10 × 30 GiB = 300 GiB peak). Point `-delivery-path` at a volume
+with enough free space, or lower `-object-concurrency` / the configured sizes.
+`-download-sink file` requires `-download-api download-object` (there is no
+file sink for the `get` stream path).
+
 **Download read-ahead (important):** the TM's `GetObject` reader only fetches
 `GetObjectBufferSize / partSize` parts ahead of the consumer, and
 `GetObjectBufferSize` defaults to just **50 MiB** — so with 32 MiB parts it fetches

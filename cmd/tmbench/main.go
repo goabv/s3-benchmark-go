@@ -7,7 +7,8 @@
 // Usage:
 //
 //	go run ./cmd/tmbench -mode download
-//	go run ./cmd/tmbench -mode download -download-api download-object   # WriterAt, parallel
+//	go run ./cmd/tmbench -mode download -download-api download-object   # WriterAt, parallel (discard)
+//	go run ./cmd/tmbench -mode download -download-api download-object -download-sink file -delivery-path /mnt/scratch
 //	go run ./cmd/tmbench -mode upload -concurrency 128 -label tm-baseline
 //	go run ./cmd/tmbench -mode both
 package main
@@ -47,16 +48,18 @@ func main() {
 	maxBuffered := flag.String("max-buffered", "", "GetObject read-ahead buffer, e.g. 64GiB (empty = config maxBufferedBytes)")
 	prefix := flag.String("prefix", "tm-upload/", "key prefix for uploaded objects")
 	downloadAPI := flag.String("download-api", "get", "TM download API: get (GetObject stream) | download-object (DownloadObject WriterAt, parallel)")
+	downloadSink := flag.String("download-sink", "discard", "download-object sink: discard (WriterAt bit-bucket) | file (WriterAt -> *os.File under -delivery-path)")
+	deliveryPath := flag.String("delivery-path", "", "directory for -download-sink file (empty = config download.deliveryPath)")
 	progress := flag.Bool("progress", true, "print a live progress indicator to stderr")
 	flag.Parse()
 
-	if err := run(*cfgPath, *mode, *region, *bucket, *label, *concurrency, *objectConc, *partSize, *maxBuffered, *prefix, *downloadAPI, *progress); err != nil {
+	if err := run(*cfgPath, *mode, *region, *bucket, *label, *concurrency, *objectConc, *partSize, *maxBuffered, *prefix, *downloadAPI, *downloadSink, *deliveryPath, *progress); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc int, partSize, maxBuffered, prefix, downloadAPI string, progress bool) error {
+func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc int, partSize, maxBuffered, prefix, downloadAPI, downloadSink, deliveryPath string, progress bool) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
@@ -93,6 +96,19 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 	case "get", "download-object":
 	default:
 		return fmt.Errorf("unknown -download-api %q (want get | download-object)", downloadAPI)
+	}
+	switch downloadSink {
+	case "discard", "file":
+	default:
+		return fmt.Errorf("unknown -download-sink %q (want discard | file)", downloadSink)
+	}
+	if downloadSink == "file" && downloadAPI != "download-object" {
+		return fmt.Errorf("-download-sink file requires -download-api download-object")
+	}
+	// Resolve the file sink directory (flag overrides config download.deliveryPath).
+	dlPath := deliveryPath
+	if dlPath == "" {
+		dlPath = cfg.Download.DeliveryPath
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -147,7 +163,7 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 
 	// "both" runs upload first, then download — each sampled and reported
 	// independently so the numbers never mix.
-	phases := phasesFor(mode, ctx, tm, cfg, prefix, downloadAPI, upObjConc, upPerObjConc, dlObjConc, dlPerObjConc, dlGetBuffer)
+	phases := phasesFor(mode, ctx, tm, cfg, prefix, downloadAPI, downloadSink, dlPath, upObjConc, upPerObjConc, dlObjConc, dlPerObjConc, dlGetBuffer)
 
 	startedAt := time.Now()
 	var runs []*bench.RunResult
@@ -203,14 +219,14 @@ type phase struct {
 // phasesFor expands a mode into ordered phases. "both" is upload then download.
 // Upload and download carry their own (object, per-object) concurrency, resolved
 // per config section.
-func phasesFor(mode string, ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prefix, downloadAPI string,
+func phasesFor(mode string, ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prefix, downloadAPI, downloadSink, deliveryPath string,
 	upObjConc, upPerObjConc, dlObjConc, dlPerObjConc int, dlGetBuffer int64) []phase {
 	upload := phase{"tm-upload", func(p *metrics.Progress) (*bench.RunResult, error) {
 		return tmbench.RunUpload(ctx, tm, cfg, p, prefix, upObjConc, upPerObjConc)
 	}}
 	download := phase{"tm-download", func(p *metrics.Progress) (*bench.RunResult, error) {
 		if downloadAPI == "download-object" {
-			return tmbench.RunDownloadObject(ctx, tm, cfg, p, dlObjConc, dlPerObjConc)
+			return tmbench.RunDownloadObject(ctx, tm, cfg, p, dlObjConc, dlPerObjConc, downloadSink, deliveryPath)
 		}
 		return tmbench.RunDownload(ctx, tm, cfg, p, dlObjConc, dlPerObjConc, dlGetBuffer)
 	}}
