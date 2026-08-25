@@ -10,9 +10,13 @@
 // below are optional per-run overrides (empty/0 = use the config value); -mode
 // selects what to run.
 //
+// -profile selects the config section: baseline (transferManager, the pristine TM
+// baseline) or optimized (tmOptimized, which carries mods like directIO / O_DIRECT).
+//
 // Usage:
 //
-//	go run ./cmd/tmbench -mode download                 # uses transferManager config
+//	go run ./cmd/tmbench -mode download                 # profile=baseline (transferManager)
+//	go run ./cmd/tmbench -mode download -profile optimized   # tmOptimized (e.g. O_DIRECT sink)
 //	go run ./cmd/tmbench -mode both -label tm-baseline
 //	go run ./cmd/tmbench -mode download -concurrency 128 -get-object-type ranges  # one-off overrides
 package main
@@ -58,16 +62,17 @@ func main() {
 	downloadSink := flag.String("download-sink", "", "override download-object sink: discard | file (empty = config transferManager.download.sink)")
 	deliveryPath := flag.String("delivery-path", "", "override sink=file directory (empty = config transferManager.download.deliveryPath)")
 	getObjectType := flag.String("get-object-type", "", "override TM download strategy: parts | ranges (empty = config transferManager.download.getObjectType)")
+	profile := flag.String("profile", "baseline", "config profile: baseline (transferManager) | optimized (tmOptimized, e.g. O_DIRECT)")
 	progress := flag.Bool("progress", true, "print a live progress indicator to stderr")
 	flag.Parse()
 
-	if err := run(*cfgPath, *mode, *region, *bucket, *label, *concurrency, *objectConc, *partSize, *maxBuffered, *prefix, *downloadAPI, *downloadSink, *deliveryPath, *getObjectType, *progress); err != nil {
+	if err := run(*cfgPath, *mode, *region, *bucket, *label, *concurrency, *objectConc, *partSize, *maxBuffered, *prefix, *downloadAPI, *downloadSink, *deliveryPath, *getObjectType, *profile, *progress); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc int, partSize, maxBuffered, prefix, downloadAPI, downloadSink, deliveryPath, getObjectType string, progress bool) error {
+func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc int, partSize, maxBuffered, prefix, downloadAPI, downloadSink, deliveryPath, getObjectType, profile string, progress bool) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
@@ -82,10 +87,21 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 		cfg.PartSize = partSize
 	}
 
-	// The transferManager section is the source of truth; flags override in place
-	// (empty/0 = keep the config value), so the captured report reflects what ran.
-	tmd := &cfg.TransferManager.Download
-	tmu := &cfg.TransferManager.Upload
+	// Select the profile's config section: baseline (pristine TM) or optimized
+	// (carries mods like directIO). The section is the source of truth; flags
+	// override in place (empty/0 = keep the config value), so the captured report
+	// reflects what ran.
+	var sel *config.TransferManager
+	switch profile {
+	case "baseline":
+		sel = &cfg.TransferManager
+	case "optimized":
+		sel = &cfg.TMOptimized
+	default:
+		return fmt.Errorf("unknown -profile %q (want baseline | optimized)", profile)
+	}
+	tmd := &sel.Download
+	tmu := &sel.Upload
 	if maxBuffered != "" {
 		n, err := config.ParseSize(maxBuffered)
 		if err != nil {
@@ -197,7 +213,7 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 
 	// "both" runs upload first, then download — each sampled and reported
 	// independently so the numbers never mix.
-	phases := phasesFor(mode, ctx, tm, cfg, upKeyPrefix, tmd.API, tmd.Sink, tmd.DeliveryPath, tmGetObjType, upObjConc, upPerObjConc, dlObjConc, dlPerObjConc, dlGetBuffer)
+	phases := phasesFor(mode, ctx, tm, cfg, *sel, upKeyPrefix, tmGetObjType, upObjConc, upPerObjConc, dlObjConc, dlPerObjConc, dlGetBuffer, tmPartSize)
 
 	startedAt := time.Now()
 	var runs []*bench.RunResult
@@ -253,16 +269,16 @@ type phase struct {
 // phasesFor expands a mode into ordered phases. "both" is upload then download.
 // Upload and download carry their own (object, per-object) concurrency, resolved
 // per config section.
-func phasesFor(mode string, ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prefix, downloadAPI, downloadSink, deliveryPath string, getObjType types.GetObjectType,
-	upObjConc, upPerObjConc, dlObjConc, dlPerObjConc int, dlGetBuffer int64) []phase {
+func phasesFor(mode string, ctx context.Context, tm *transfermanager.Client, cfg *config.Config, sec config.TransferManager, upKeyPrefix string, getObjType types.GetObjectType,
+	upObjConc, upPerObjConc, dlObjConc, dlPerObjConc int, dlGetBuffer, bufSz int64) []phase {
 	upload := phase{"tm-upload", func(p *metrics.Progress) (*bench.RunResult, error) {
-		return tmbench.RunUpload(ctx, tm, cfg, p, prefix, upObjConc, upPerObjConc)
+		return tmbench.RunUpload(ctx, tm, cfg, p, sec, upKeyPrefix, upObjConc, upPerObjConc)
 	}}
 	download := phase{"tm-download", func(p *metrics.Progress) (*bench.RunResult, error) {
-		if downloadAPI == "download-object" {
-			return tmbench.RunDownloadObject(ctx, tm, cfg, p, dlObjConc, dlPerObjConc, downloadSink, deliveryPath, getObjType)
+		if sec.Download.API == "download-object" {
+			return tmbench.RunDownloadObject(ctx, tm, cfg, p, sec, dlObjConc, dlPerObjConc, getObjType, bufSz)
 		}
-		return tmbench.RunDownload(ctx, tm, cfg, p, dlObjConc, dlPerObjConc, dlGetBuffer, getObjType)
+		return tmbench.RunDownload(ctx, tm, cfg, p, sec, dlObjConc, dlPerObjConc, dlGetBuffer, getObjType)
 	}}
 	switch mode {
 	case "upload":

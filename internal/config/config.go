@@ -80,6 +80,11 @@ type TMDownload struct {
 	ValidateChecksum  bool   `json:"validateChecksum"`
 	MaxBufferedBytes  int64  `json:"maxBufferedBytes"` // GetObject read-ahead ("get" API only)
 	StallTimeoutMs    int    `json:"stallTimeoutMs"`
+	// DirectIO (optimized profile only) writes the file sink with O_DIRECT,
+	// bypassing the page cache so concurrent part-writers hit the disk in parallel
+	// instead of serializing on the buffered single-inode write path. Baseline
+	// leaves this false.
+	DirectIO bool `json:"directIO"`
 }
 
 // StallTimeout returns the TM download stall-watchdog timeout.
@@ -110,6 +115,41 @@ type TransferManager struct {
 	Upload   TMUpload   `json:"upload"`
 }
 
+// applyTMDefaults fills unset fields of a Transfer Manager section (baseline or
+// optimized) with defaults. ObjectConcurrency/Concurrency are intentionally left
+// at 0 ("auto"), and DirectIO defaults to false.
+func applyTMDefaults(tm *TransferManager) {
+	d := &tm.Download
+	if d.API == "" {
+		d.API = "get"
+	}
+	if d.GetObjectType == "" {
+		d.GetObjectType = "parts"
+	}
+	if d.Sink == "" {
+		d.Sink = "discard"
+	}
+	if d.DeliveryPath == "" {
+		d.DeliveryPath = os.TempDir()
+	}
+	if d.Iterations <= 0 {
+		d.Iterations = 1
+	}
+	if d.StallTimeoutMs <= 0 {
+		d.StallTimeoutMs = 30000
+	}
+	u := &tm.Upload
+	if u.Iterations <= 0 {
+		u.Iterations = 1
+	}
+	if u.KeyPrefix == "" {
+		u.KeyPrefix = "tm-upload/"
+	}
+	if u.StallTimeoutMs <= 0 {
+		u.StallTimeoutMs = 30000
+	}
+}
+
 // Sampling controls the background time-series resource sampler.
 type Sampling struct {
 	Enabled    bool `json:"enabled"`
@@ -138,8 +178,12 @@ type Config struct {
 	Download        Download        `json:"download"`
 	Upload          Upload          `json:"upload"`
 	TransferManager TransferManager `json:"transferManager"`
-	Sampling        Sampling        `json:"sampling"`
-	Results         Results         `json:"results"`
+	// TMOptimized is the "optimized" TM profile (cmd/tmbench -profile optimized):
+	// same shape as TransferManager but carries the optimization knobs (e.g.
+	// DirectIO). transferManager stays the pristine baseline; all mods live here.
+	TMOptimized TransferManager `json:"tmOptimized"`
+	Sampling    Sampling        `json:"sampling"`
+	Results     Results         `json:"results"`
 }
 
 // Load reads and parses a bench.config.json file.
@@ -205,38 +249,12 @@ func (c *Config) applyDefaults() {
 		c.Upload.KeyPrefix = "bench-upload/"
 	}
 
-	// Transfer Manager (v2 baseline) defaults. ObjectConcurrency/Concurrency stay
+	// Transfer Manager defaults, applied to both the baseline (transferManager)
+	// and optimized (tmOptimized) sections. ObjectConcurrency/Concurrency stay
 	// 0 = "auto" and are resolved by cmd/tmbench (0 objects -> object count; 0
 	// per-object -> SDK default).
-	tmd := &c.TransferManager.Download
-	if tmd.API == "" {
-		tmd.API = "get"
-	}
-	if tmd.GetObjectType == "" {
-		tmd.GetObjectType = "parts"
-	}
-	if tmd.Sink == "" {
-		tmd.Sink = "discard"
-	}
-	if tmd.DeliveryPath == "" {
-		tmd.DeliveryPath = os.TempDir()
-	}
-	if tmd.Iterations <= 0 {
-		tmd.Iterations = 1
-	}
-	if tmd.StallTimeoutMs <= 0 {
-		tmd.StallTimeoutMs = 30000
-	}
-	tmu := &c.TransferManager.Upload
-	if tmu.Iterations <= 0 {
-		tmu.Iterations = 1
-	}
-	if tmu.KeyPrefix == "" {
-		tmu.KeyPrefix = "tm-upload/"
-	}
-	if tmu.StallTimeoutMs <= 0 {
-		tmu.StallTimeoutMs = 30000
-	}
+	applyTMDefaults(&c.TransferManager)
+	applyTMDefaults(&c.TMOptimized)
 
 	if c.Sampling.IntervalMs <= 0 {
 		c.Sampling.IntervalMs = 250

@@ -153,6 +153,40 @@ concurrently (e.g. 10 × 30 GiB = 300 GiB peak). Point `deliveryPath` at a volum
 enough free space, or lower `objectConcurrency` / the configured sizes. `sink: file`
 requires `api: download-object`.
 
+### Profiles: baseline vs optimized (`-profile`)
+
+`transferManager` is the **pristine out-of-the-box baseline** and stays that way.
+Optimizations live in a separate top-level **`tmOptimized`** section (same shape),
+selected with `-profile`:
+
+```sh
+./scripts/tm-run.sh download tm-base   # -profile baseline (default) -> transferManager
+./scripts/tm-run.sh download tm-odirect -profile optimized  # -> tmOptimized
+```
+
+`tmOptimized` carries the same download/upload knobs plus optimization flags. The
+first is **`directIO`** — when `true` (with `sink: file`), the file sink writes with
+**O_DIRECT** instead of buffered I/O:
+
+- Buffered `sink: file` (baseline) funnels all of an object's part-writes through one
+  inode with the kernel's exclusive per-inode write lock, so a **single** large file
+  tops out at roughly single-threaded write speed (~20 Gbps on a 6× gp3 RAID0 here).
+- `directIO: true` bypasses the page cache; XFS uses a *shared* inode lock for
+  O_DIRECT, so the concurrent part-writers hit the stripe in parallel and approach its
+  ceiling (~40 Gbps / 5 GB/s). It buffers each aligned part (32 MiB) and issues one
+  aligned, cache-bypassing write per part; the final sub-block tail is padded and the
+  file `ftruncate`d back to size.
+
+Notes:
+- **Linux only.** O_DIRECT is Linux-specific; the sink errors cleanly on other OSes
+  (the dev build still compiles via a stub).
+- **Memory.** The O_DIRECT sink holds ~`concurrency` aligned parts per object in flight
+  (`concurrency × partSize`, e.g. 256 × 32 MiB ≈ 8 GiB for one object). It scales with
+  `objectConcurrency × concurrency × partSize`, so keep object count modest at high
+  concurrency (a single large file is the intended workload).
+- Run the optimized profile at high `concurrency` (e.g. 256) so the download isn't the
+  bottleneck — a single object needs enough connections to feed the disk.
+
 **Download read-ahead (important):** the TM's `GetObject` reader only fetches
 `GetObjectBufferSize / partSize` parts ahead of the consumer, and
 `GetObjectBufferSize` defaults to just **50 MiB** — so with 32 MiB parts it fetches

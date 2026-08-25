@@ -3,7 +3,7 @@
   "region": "us-west-2",
   "dataPrefix": "bench/",
   "codePrefix": "code-go/",
-  "sizes": [{ "size": "30GiB", "count": 10 }],
+  "sizes": [{ "size": "50GiB", "count": 1 }],
   "partSize": "32MiB",
   "checksum": "CRC32",
 
@@ -37,7 +37,7 @@
       "api": "download-object",
       "getObjectType": "parts",
       "sink": "file",
-      "deliveryPath": "/mnt/stripe",
+      "deliveryPath": "/mnt/stripe/output",
       "objectConcurrency": 0,
       "concurrency": 64,
       "iterations": 1,
@@ -45,6 +45,31 @@
       "validateChecksum": true,
       "maxBufferedBytes": 68719476736,
       "stallTimeoutMs": 30000
+    },
+    "upload": {
+      "objectConcurrency": 0,
+      "concurrency": 8,
+      "iterations": 1,
+      "warmup": 0,
+      "keyPrefix": "tm-upload/",
+      "stallTimeoutMs": 30000
+    }
+  },
+
+  "tmOptimized": {
+    "download": {
+      "api": "download-object",
+      "getObjectType": "parts",
+      "sink": "file",
+      "deliveryPath": "/mnt/stripe/output",
+      "objectConcurrency": 0,
+      "concurrency": 256,
+      "iterations": 1,
+      "warmup": 0,
+      "validateChecksum": true,
+      "maxBufferedBytes": 68719476736,
+      "stallTimeoutMs": 30000,
+      "directIO": true
     },
     "upload": {
       "objectConcurrency": 0,
