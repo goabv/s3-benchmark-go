@@ -25,6 +25,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
 
 	"github.com/goabv/s3-benchmark-go/internal/bench"
 	"github.com/goabv/s3-benchmark-go/internal/config"
@@ -191,13 +192,13 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 // RunDownload downloads the seeded objects (dataPrefix keys) per size group via
 // the Transfer Manager's GetObject, draining each body to memory (io.Discard).
 // Objects transfer concurrently through a pool of objectConcurrency.
-func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prog *metrics.Progress, objectConcurrency, perObjectConcurrency int, getBuffer int64) (*bench.RunResult, error) {
+func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prog *metrics.Progress, objectConcurrency, perObjectConcurrency int, getBuffer int64, getObjType types.GetObjectType) (*bench.RunResult, error) {
 	if prog == nil {
 		prog = &metrics.Progress{}
 	}
 
 	fmt.Printf("=== S3 Transfer Manager DOWNLOAD benchmark (feature/s3/transfermanager) ===\n")
-	fmt.Printf("region=%s  bucket=%s  sink=memory(discard)\n", cfg.Region, cfg.Bucket)
+	fmt.Printf("region=%s  bucket=%s  sink=memory(discard)  get-object-type=%s\n", cfg.Region, cfg.Bucket, getObjType)
 	fmt.Printf("object-concurrency=%d  per-object part-concurrency=%d  ~parts-in-flight=%d  iterations=%d (warmup=%d)\n\n",
 		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, cfg.Download.Iterations, cfg.Download.Warmup)
 
@@ -220,6 +221,9 @@ func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Co
 					Key:    aws.String(key),
 				}, func(o *transfermanager.Options) {
 					o.Concurrency = perObjectConcurrency
+					if getObjType != "" {
+						o.GetObjectType = getObjType
+					}
 					if getBuffer > 0 {
 						o.GetObjectBufferSize = getBuffer
 					}
@@ -257,7 +261,7 @@ func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Co
 // (bytes are counted for throughput, then dropped), so this measures the TM's
 // parallel-write ceiling. Objects transfer concurrently through a pool of
 // objectConcurrency; each object's parts run at perObjectConcurrency.
-func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prog *metrics.Progress, objectConcurrency, perObjectConcurrency int, sink, deliveryPath string) (*bench.RunResult, error) {
+func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prog *metrics.Progress, objectConcurrency, perObjectConcurrency int, sink, deliveryPath string, getObjType types.GetObjectType) (*bench.RunResult, error) {
 	if prog == nil {
 		prog = &metrics.Progress{}
 	}
@@ -274,7 +278,7 @@ func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *con
 	}
 
 	fmt.Printf("=== S3 Transfer Manager DOWNLOAD benchmark (DownloadObject, WriterAt) ===\n")
-	fmt.Printf("region=%s  bucket=%s  sink=%s\n", cfg.Region, cfg.Bucket, sinkDesc)
+	fmt.Printf("region=%s  bucket=%s  sink=%s  get-object-type=%s\n", cfg.Region, cfg.Bucket, sinkDesc, getObjType)
 	fmt.Printf("object-concurrency=%d  per-object part-concurrency=%d  ~parts-in-flight=%d  iterations=%d (warmup=%d)\n\n",
 		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, cfg.Download.Iterations, cfg.Download.Warmup)
 
@@ -314,6 +318,9 @@ func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *con
 					WriterAt: w,
 				}, func(o *transfermanager.Options) {
 					o.Concurrency = perObjectConcurrency
+					if getObjType != "" {
+						o.GetObjectType = getObjType
+					}
 				})
 				if e != nil {
 					return fmt.Errorf("DownloadObject %q: %w", key, e)

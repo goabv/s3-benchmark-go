@@ -148,6 +148,27 @@ with enough free space, or lower `-object-concurrency` / the configured sizes.
 `-download-sink file` requires `-download-api download-object` (there is no
 file sink for the `get` stream path).
 
+**Multipart download strategy (`-get-object-type`, default `parts`):** the TM
+supports two ways to split a download, applied to both download APIs. The default
+matches the SDK's own default (`GetObjectParts`):
+
+- `parts` (default) — fetch by **PartNumber**, following the object's *upload* part
+  boundaries. A first serial `GetObject(PartNumber=1)` learns the part count, then
+  parts `2..N` are fetched `concurrency`-at-a-time. Part size is fixed by how the
+  object was uploaded, so `-part-size` does **not** change download chunking here.
+  Requires a multipart object with >1 part, or there's nothing to parallelize.
+- `ranges` — ignore upload boundaries and fetch **byte ranges of `partSize`**
+  (config `partSize` / `-part-size`), always parallel regardless of how the object
+  was uploaded. This is the mode where part size is a download-side lever.
+
+```sh
+# compare strategies on the same object:
+./scripts/tm-run.sh download tm-parts  -download-api download-object -get-object-type parts
+./scripts/tm-run.sh download tm-ranges -download-api download-object -get-object-type ranges -part-size 32MiB
+```
+
+The resolved strategy is printed in the run header (`get-object-type=PART|RANGE`).
+
 **Download read-ahead (important):** the TM's `GetObject` reader only fetches
 `GetObjectBufferSize / partSize` parts ahead of the consumer, and
 `GetObjectBufferSize` defaults to just **50 MiB** — so with 32 MiB parts it fetches
