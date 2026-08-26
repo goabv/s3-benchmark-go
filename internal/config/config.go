@@ -85,6 +85,11 @@ type TMDownload struct {
 	// instead of serializing on the buffered single-inode write path. Baseline
 	// leaves this false.
 	DirectIO bool `json:"directIO"`
+	// MultiNIC (optimized profile only) round-robins outbound connections across
+	// all of the host's ENI source IPs to spread load over multiple network cards.
+	// Requires host-side policy routing (scripts/setup-multinic.sh). Baseline
+	// leaves this false.
+	MultiNIC bool `json:"multiNIC"`
 }
 
 // StallTimeout returns the TM download stall-watchdog timeout.

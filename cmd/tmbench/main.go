@@ -188,10 +188,17 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 	if maxConns < 64 {
 		maxConns = 64
 	}
+	var localIPs []string
+	if tmd.MultiNIC {
+		localIPs = s3client.LocalIPv4s()
+		fmt.Printf("multi-NIC: round-robin connections across %d local IP(s): %s\n\n",
+			len(localIPs), strings.Join(localIPs, ", "))
+	}
 	s3c, err := s3client.New(ctx, s3client.Options{
 		Region:   cfg.Region,
 		MaxConns: maxConns,
 		TLS:      true,
+		LocalIPs: localIPs,
 	})
 	if err != nil {
 		return err

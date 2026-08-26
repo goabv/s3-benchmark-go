@@ -9,7 +9,9 @@ import (
 	"crypto/tls"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
@@ -22,6 +24,12 @@ type Options struct {
 	MaxConns          int  // max idle keep-alive conns per host (size to your concurrency)
 	SpreadConnections bool // round-robin sockets across all resolved S3 IPs
 	TLS               bool // false -> plaintext HTTP endpoint (measure TLS overhead)
+	// LocalIPs, when non-empty, round-robins each outbound connection's SOURCE
+	// address across these local IPs to spread traffic across multiple network
+	// cards (ENIs). Requires host-side source-based policy routing (see
+	// scripts/setup-multinic.sh) for a connection to actually egress the matching
+	// card. Empty = single default source (today's behavior).
+	LocalIPs []string
 }
 
 // New constructs an *s3.Client with a transport tuned per opts.
@@ -40,11 +48,7 @@ func New(ctx context.Context, opts Options) (*s3.Client, error) {
 	}
 
 	base := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-	if opts.SpreadConnections {
-		transport.DialContext = spreadDialer(base)
-	} else {
-		transport.DialContext = base.DialContext
-	}
+	transport.DialContext = newDialer(base, parseLocalIPs(opts.LocalIPs), opts.SpreadConnections)
 
 	httpClient := &http.Client{Transport: transport}
 
@@ -64,12 +68,40 @@ func New(ctx context.Context, opts Options) (*s3.Client, error) {
 	}), nil
 }
 
-// spreadDialer resolves the target host's A-records and round-robins new sockets
-// across them so N concurrent connections fan out over many S3 front-ends instead
-// of piling onto one IP. TLS still runs against the original hostname: the
-// transport derives SNI/cert validation from the dial address's host, while this
-// dialer only changes which IP the raw socket connects to.
-func spreadDialer(base *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+// newDialer builds a DialContext that optionally (a) round-robins each
+// connection's SOURCE address across localIPs (multi-NIC spreading across ENIs)
+// and (b) round-robins the DESTINATION across the target host's resolved IPs (S3
+// front-end spreading). Either, both, or neither may be active.
+//
+// TLS still runs against the original hostname: the transport derives SNI/cert
+// validation from the dial address's host; this dialer only changes the source
+// address and/or which resolved IP the raw socket connects to.
+func newDialer(base *net.Dialer, localIPs []net.IP, spread bool) func(context.Context, string, string) (net.Conn, error) {
+	var li uint64
+	pickDest := newDestPicker()
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		d := *base // copy so per-connection LocalAddr doesn't race
+		if len(localIPs) > 0 {
+			ip := localIPs[atomic.AddUint64(&li, 1)%uint64(len(localIPs))]
+			d.LocalAddr = &net.TCPAddr{IP: ip}
+		}
+		if !spread {
+			return d.DialContext(ctx, network, addr)
+		}
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return d.DialContext(ctx, network, addr)
+		}
+		if ip := pickDest(host); ip != "" {
+			return d.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		}
+		return d.DialContext(ctx, network, addr)
+	}
+}
+
+// newDestPicker resolves a host's A-records and round-robins across them (short
+// TTL cache) so N concurrent connections fan out over many S3 front-end IPs.
+func newDestPicker() func(host string) string {
 	const ttl = time.Second
 	type entry struct {
 		ips []string
@@ -78,8 +110,7 @@ func spreadDialer(base *net.Dialer) func(context.Context, string, string) (net.C
 	}
 	var mu sync.Mutex
 	cache := map[string]*entry{}
-
-	pick := func(host string) string {
+	return func(host string) string {
 		mu.Lock()
 		defer mu.Unlock()
 		e := cache[host]
@@ -99,15 +130,50 @@ func spreadDialer(base *net.Dialer) func(context.Context, string, string) (net.C
 		e.idx++
 		return ip
 	}
+}
 
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return base.DialContext(ctx, network, addr)
+// parseLocalIPs parses IP strings, silently dropping any that don't parse.
+func parseLocalIPs(ss []string) []net.IP {
+	var out []net.IP
+	for _, s := range ss {
+		if ip := net.ParseIP(strings.TrimSpace(s)); ip != nil {
+			out = append(out, ip)
 		}
-		if ip := pick(host); ip != "" {
-			return base.DialContext(ctx, network, net.JoinHostPort(ip, port))
-		}
-		return base.DialContext(ctx, network, addr)
 	}
+	return out
+}
+
+// LocalIPv4s returns the host's usable IPv4 addresses (global-unicast,
+// non-loopback, non-link-local) — typically one per attached ENI. Used to
+// auto-populate Options.LocalIPs for multi-NIC spreading.
+func LocalIPv4s() []string {
+	var out []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return out
+	}
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			ip4 := ip.To4()
+			if ip4 == nil || !ip.IsGlobalUnicast() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+			out = append(out, ip4.String())
+		}
+	}
+	return out
 }

@@ -69,7 +69,8 @@
       "validateChecksum": true,
       "maxBufferedBytes": 68719476736,
       "stallTimeoutMs": 30000,
-      "directIO": true
+      "directIO": true,
+      "multiNIC": true
     },
     "upload": {
       "objectConcurrency": 0,

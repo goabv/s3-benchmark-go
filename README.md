@@ -187,6 +187,15 @@ Notes:
 - Run the optimized profile at high `concurrency` (e.g. 256) so the download isn't the
   bottleneck — a single object needs enough connections to feed the disk.
 
+**`multiNIC` (optimized profile).** When `true`, the client round-robins each
+outbound connection's *source IP* across all of the host's ENI addresses, spreading
+load over multiple network cards (e.g. i8ge.48xlarge's 2 × 150 Gbps). This only
+helps if the host has multiple ENIs **and** source-based policy routing is in place —
+run `sudo ./scripts/setup-multinic.sh` first (it installs per-ENI route tables + `ip
+rule from <ip>` + `rp_filter=2`). On a single-NIC box it resolves to one IP and is a
+no-op. Verify it's actually spreading by watching per-ENI byte counters
+(`sar -n DEV 1` or `/proc/net/dev`) during a run — both cards should carry ~equal RX.
+
 **Download read-ahead (important):** the TM's `GetObject` reader only fetches
 `GetObjectBufferSize / partSize` parts ahead of the consumer, and
 `GetObjectBufferSize` defaults to just **50 MiB** — so with 32 MiB parts it fetches
