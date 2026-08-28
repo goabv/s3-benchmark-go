@@ -1,385 +1,202 @@
-# S3 Benchmark Runner (Go)
+# S3 Transfer Manager Benchmark (Go)
 
-A high-throughput S3 benchmark built on the AWS SDK for Go v2. It has two runners
-that target the **same seeded S3 objects** (same `bench.config.json`), on the same
-host and config, so their numbers are directly comparable:
+A high-throughput benchmark for the **AWS SDK for Go v2 S3 Transfer Manager**
+(`feature/s3/transfermanager`). It runs upload and download workloads against
+seeded S3 objects and reports throughput, latency percentiles, and process
+resource usage, so you can compare the SDK's out-of-the-box behavior (the
+**baseline** profile) against tuned variants (the **optimized** profile).
 
-- **custom runner** (`cmd/bench`) — a hand-tuned parallel ranged-GET-by-PartNumber
-  downloader and multipart-PUT uploader: shared worker pool, delivery modes
-  (discard / ordered-stream / file), per-part timing, retries, stall watchdog, and
-  connection spreading.
-- **Transfer Manager runner** (`cmd/tmbench`) — the same workload run through the
-  **latest AWS SDK for Go v2 S3 Transfer Manager** (`feature/s3/transfermanager`)
-  as an out-of-the-box baseline, using its `UploadObject` / `GetObject` operations.
+The optimized profile pulls in a **fork** of the Transfer Manager
+(`github.com/goabv/aws-sdk-go-v2`, branch `transfermanager-downloadfile`) that adds
+a new **`DownloadFile`** operation: the SDK owns the destination file and writes it
+with O_DIRECT for large objects. The fork is wired in via a `replace` directive in
+`go.mod`.
 
-The point of the project is to measure the custom runner against the SDK's Transfer
-Manager on identical objects, hardware, and configuration. The Transfer Manager
-dependency is pinned in `go.mod`; bump it to track the latest release.
+## Runner
+
+There is a single runner, `cmd/tmbench`. It is a thin wrapper that drives the
+Transfer Manager operations and provides the sink/consumer each download API needs:
+
+| download `api` | SDK operation | what the runner provides |
+|---|---|---|
+| `get` | `GetObject` | drains the returned stream to a counting discard sink |
+| `download-object` + `sink: discard` | `DownloadObject` | a `discardWriterAt` (WriterAt bit-bucket, counts bytes) |
+| `download-object` + `sink: file` | `DownloadObject` | a buffered `*os.File` WriterAt under `deliveryPath` |
+| `download-file` | `DownloadFile` (fork) | nothing — the SDK owns the file sink (O_DIRECT / buffered) |
+
+Upload uses `UploadObject`, streaming each object from a small repeating in-memory
+pattern (no whole-object allocation). Both directions transfer objects in parallel
+(`objectConcurrency`), and each object's parts run at the TM's own `concurrency`, so
+parts in flight ≈ `objectConcurrency × concurrency`.
+
+## Modes and profiles
+
+Modes (`-mode`): `seed | upload | download | both`.
+
+- `seed` — idempotent data-prep: upload the configured sizes to the download keys,
+  skipping any that already exist (HeadObject check). No sampling or report.
+- `upload` / `download` — one direction, sampled and reported.
+- `both` — upload then download, each sampled and reported independently (never mixed).
+
+Profiles (`-profile`): `baseline` (config section `transferManager`) or `optimized`
+(config section `tmOptimized`). `transferManager` is the pristine out-of-the-box
+baseline (standard `GetObject` / `DownloadObject` / `UploadObject`, unchanged by the
+fork). `tmOptimized` carries the optimization knobs — `multiNIC` and the
+`DownloadFile` O_DIRECT controls. The config section is the source of truth; flags
+override in place.
 
 ## Layout
 
 ```
-cmd/bench/main.go            entrypoint: load config, flags, sampler/watchdog, dispatch, report
-cmd/tmbench/main.go          Transfer Manager baseline runner (in-memory, default SDK TM)
-internal/tmbench/tmbench.go  TM UploadObject/GetObject benchmark, in-memory bodies
-internal/config/config.go    config struct, JSON load, size parsing, key naming
-internal/s3client/client.go  tuned HTTP/1.1 transport + connection spreading
-internal/bench/download.go   ranged GET by PartNumber, goroutine pool, retry, ordered delivery
-internal/bench/upload.go     multipart PUT: create, parallel UploadPart, complete/abort
-internal/bench/orderer.go    in-order stream reassembly over a buffer pool
-internal/bench/trace.go      httptrace capture of served front-end IP + conn reuse
-internal/bench/retry.go      per-part retry with capped exponential backoff
-internal/bufpool/pool.go     recycled fixed-size byte buffers
-internal/metrics/*.go        latency percentiles, resource sampler, stall watchdog, SVG plot
-internal/report/report.go    JSON run capture + SVG plot, optional S3 upload
-scripts/push.ps1             Windows dev -> S3: sync source to the code prefix
-scripts/pull.sh              EC2: sync source from S3 + install Go + build
-scripts/run.sh               EC2: build (if needed) + run + capture, upload run to S3
-scripts/tm-run.sh            EC2: Transfer Manager baseline runner (in-memory)
-scripts/sweep-download.sh    EC2: seed + download sweep across the size curve (scratch JSON)
-scripts/sweep-upload.sh      EC2: upload sweep across the size curve (scratch JSON)
-scripts/sweep-download.ps1   Windows: local download sweep (smoke; use the .sh on EC2 for real numbers)
-scripts/sweep-upload.ps1     Windows: local upload sweep (smoke)
-scripts/tune-network.sh      EC2: one-time network tuning (BBR, buffers, initcwnd), with --revert
-scripts/pull-results.ps1     Windows dev <- S3: sync captured runs back to commit
+cmd/tmbench/main.go            entrypoint: config, flags, sampler/watchdog, dispatch, report
+internal/tmbench/tmbench.go    the runner: RunSeed / RunUpload / RunDownload (get) /
+                               RunDownloadObject (WriterAt) / RunDownloadFile
+internal/config/config.go      config struct, JSON load, size parsing, key naming
+internal/s3client/client.go    tuned HTTP/1.1 transport + optional multi-NIC / conn spreading
+internal/bench/result.go       shared result/sample/resource types (consumed by tmbench + report)
+internal/metrics/*.go          latency percentiles, resource sampler, stall watchdog, SVG plot
+internal/report/*.go           JSON run capture + SVG plot, optional S3 upload
+scripts/push.ps1               Windows dev -> S3: sync source to the code prefix
+scripts/pull.sh                EC2: sync source from S3, install Go, build tmbench
+scripts/tm-run.sh              EC2: build (if needed) + run + capture, upload run to S3
+scripts/pull-results.ps1       Windows dev <- S3: sync captured runs back to commit
+scripts/tune-network.sh        EC2: one-time network tuning (BBR, buffers, initcwnd), with --revert
+scripts/setup-multinic.sh      EC2: per-ENI source-based policy routing for multiNIC
 ```
-
-## Run (local)
-
-```sh
-go run ./cmd/bench -mode seed         # upload the configured sizes to dataPrefix (skips existing)
-go run ./cmd/bench -mode download     # ranged-GET throughput across the size curve
-go run ./cmd/bench -mode upload       # multipart-PUT throughput
-go run ./cmd/bench -mode both         # upload then download, reported separately
-```
-
-Per-run overrides (take precedence over the config):
-
-```sh
-go run ./cmd/bench -mode download -workers 60 -concurrency 5 -iterations 3 -warmup 1 -part-size 32MiB
-go run ./cmd/bench -mode download -delivery ordered-stream -max-buffered 64GiB
-go run ./cmd/bench -mode download -delivery file -delivery-path /mnt/data
-go run ./cmd/bench -mode download -no-checksum      # disable per-part CRC32 validation
-go run ./cmd/bench -mode download -no-tls           # plaintext HTTP endpoint (measure TLS overhead)
-go run ./cmd/bench -mode download -out results/download-sweep.json   # scratch JSON, no run dir
-```
-
-Credentials resolve via the default AWS chain (env, shared config, SSO, or the
-EC2 instance role). On the benchmark EC2 host the instance role is used.
-
-## Transfer Manager baseline (`tmbench`)
-
-A separate runner benchmarks the **latest AWS SDK for Go v2 S3 Transfer Manager**
-(`feature/s3/transfermanager`) as an out-of-the-box baseline, using its
-`UploadObject` and either `GetObject` (streaming) or `DownloadObject` (`WriterAt`)
-operations:
-
-- **upload** streams each object from a small repeating in-memory buffer (no
-  whole-object allocation), letting the TM multipart it automatically
-- **download** either drains each `GetObject` body to a counting sink, or hands
-  `DownloadObject` an `io.WriterAt` — a discarding bit-bucket (`sink: discard`, the
-  default, in-memory) or a real file (`sink: file`, to disk)
-
-It targets the same seeded objects (same `bench.config.json`) as the main
-benchmark, and captures into the same `results/runs/` layout (`tm-upload-sweep.json`
-/ `tm-download-sweep.json`) so the TM baseline and the custom runner are directly
-comparable.
-
-Both upload and download transfer **objects in parallel**, and each object's parts
-run at the TM's own concurrency, so total parts in flight is
-`objectConcurrency × concurrency`.
-
-All Transfer Manager knobs live in `bench.config.json` under a dedicated
-**`transferManager`** section — separate from the `download` / `upload` sections
-the custom (optimized) runner uses, so the two never share meaning. The config is
-the source of truth; the CLI flags below are optional per-run overrides (empty
-string / `0` = "use the config value").
-
-```json
-"transferManager": {
-  "download": {
-    "api": "download-object",        // get (GetObject stream) | download-object (WriterAt, parallel)
-    "getObjectType": "parts",        // parts (PartNumber) | ranges (byte ranges of partSize)
-    "sink": "discard",               // discard (bit-bucket) | file (*os.File under deliveryPath)
-    "deliveryPath": "/tmp",          // directory for sink=file
-    "objectConcurrency": 0,          // objects in parallel (0 = object count)
-    "concurrency": 64,               // per-object part concurrency (0 = SDK default, 5)
-    "iterations": 1, "warmup": 0,
-    "validateChecksum": true,        // false -> DisableChecksumValidation (skip the CRC pass)
-    "maxBufferedBytes": 68719476736  // GetObject read-ahead total ("get" API only)
-  },
-  "upload": {
-    "objectConcurrency": 0, "concurrency": 8,
-    "iterations": 1, "warmup": 0, "keyPrefix": "tm-upload/"
-  }
-}
-```
-
-`partSize` stays top-level (shared with the custom runner). Both runners target the
-same seeded objects and capture into the same `results/runs/` layout
-(`tm-upload-sweep.json` / `tm-download-sweep.json`), so the TM baseline and the
-custom runner stay directly comparable.
-
-The knobs (each with a one-off `-flag` override):
-
-- **`api`** (`-download-api`) — `get` = `GetObject`, one ordered `io.Reader` per
-  object (parts fetched concurrently but delivered in order through a single reader,
-  bounded by `maxBufferedBytes`); `download-object` = `DownloadObject`, parts written
-  to an `io.WriterAt` at their offsets, fully parallel, no single-reader funnel.
-- **`sink`** (`-download-sink`, download-object only) — `discard` measures the
-  network + SDK receive ceiling; `file` writes a real `*os.File` per object under
-  `deliveryPath` (removed after each object) to measure download-to-disk, which on
-  EBS-only instances is EBS-bound, not NIC-bound.
-- **`getObjectType`** (`-get-object-type`) — `parts` fetches by PartNumber following
-  the object's *upload* boundaries (so `partSize` does **not** change download
-  chunking); `ranges` fetches byte ranges of `partSize`, always parallel. Printed in
-  the run header as `get-object-type=PART|RANGE`.
-- **`objectConcurrency` / `concurrency`** (`-object-concurrency` / `-concurrency`) —
-  objects in parallel and per-object part concurrency.
-- **`validateChecksum`** — `false` sets `DisableChecksumValidation` to skip the CRC
-  pass over every byte (isolates the network/disk ceiling from checksum CPU).
-
-```sh
-# config drives everything:
-./scripts/tm-run.sh download tm-dlobj
-./scripts/tm-run.sh both tm-baseline
-# one-off overrides without editing the config:
-./scripts/tm-run.sh download tm-ranges -get-object-type ranges -part-size 32MiB
-./scripts/tm-run.sh download tm-c128   -concurrency 128
-```
-
-Disk-space warning for `sink: file`: it writes up to `objectConcurrency × object-size`
-concurrently (e.g. 10 × 30 GiB = 300 GiB peak). Point `deliveryPath` at a volume with
-enough free space, or lower `objectConcurrency` / the configured sizes. `sink: file`
-requires `api: download-object`.
-
-### Profiles: baseline vs optimized (`-profile`)
-
-`transferManager` is the **pristine out-of-the-box baseline** and stays that way.
-Optimizations live in a separate top-level **`tmOptimized`** section (same shape),
-selected with `-profile`:
-
-```sh
-./scripts/tm-run.sh download tm-base   # -profile baseline (default) -> transferManager
-./scripts/tm-run.sh download tm-odirect -profile optimized  # -> tmOptimized
-```
-
-`tmOptimized` carries the same download/upload knobs plus optimization flags. The
-first is **`directIO`** — when `true` (with `sink: file`), the file sink writes with
-**O_DIRECT** instead of buffered I/O:
-
-- Buffered `sink: file` (baseline) funnels all of an object's part-writes through one
-  inode with the kernel's exclusive per-inode write lock, so a **single** large file
-  tops out at roughly single-threaded write speed (~20 Gbps on a 6× gp3 RAID0 here).
-- `directIO: true` bypasses the page cache; XFS uses a *shared* inode lock for
-  O_DIRECT, so the concurrent part-writers hit the stripe in parallel and approach its
-  ceiling (~40 Gbps / 5 GB/s). It buffers each aligned part (32 MiB) and issues one
-  aligned, cache-bypassing write per part; the final sub-block tail is padded and the
-  file `ftruncate`d back to size.
-
-Notes:
-- **Linux only.** O_DIRECT is Linux-specific; the sink errors cleanly on other OSes
-  (the dev build still compiles via a stub).
-- **Memory.** The O_DIRECT sink holds ~`concurrency` aligned parts per object in flight
-  (`concurrency × partSize`, e.g. 256 × 32 MiB ≈ 8 GiB for one object). It scales with
-  `objectConcurrency × concurrency × partSize`, so keep object count modest at high
-  concurrency (a single large file is the intended workload).
-- Run the optimized profile at high `concurrency` (e.g. 256) so the download isn't the
-  bottleneck — a single object needs enough connections to feed the disk.
-
-**`multiNIC` (optimized profile).** When `true`, the client round-robins each
-outbound connection's *source IP* across all of the host's ENI addresses, spreading
-load over multiple network cards (e.g. i8ge.48xlarge's 2 × 150 Gbps). This only
-helps if the host has multiple ENIs **and** source-based policy routing is in place —
-run `sudo ./scripts/setup-multinic.sh` first (it installs per-ENI route tables + `ip
-rule from <ip>` + `rp_filter=2`). On a single-NIC box it resolves to one IP and is a
-no-op. Verify it's actually spreading by watching per-ENI byte counters
-(`sar -n DEV 1` or `/proc/net/dev`) during a run — both cards should carry ~equal RX.
-
-**Download read-ahead (important):** the TM's `GetObject` reader only fetches
-`GetObjectBufferSize / partSize` parts ahead of the consumer, and
-`GetObjectBufferSize` defaults to just **50 MiB** — so with 32 MiB parts it fetches
-only ~1 part at a time regardless of `Concurrency`, which throttles download hard.
-`tmbench` drives `GetObjectBufferSize` from the
-`transferManager.download.maxBufferedBytes` config key (default 64 GiB). Because `GetObjectBufferSize` is
-per-`GetObject`-call, that value is treated as a **total** budget and split across
-the objects in flight (`maxBufferedBytes / object-concurrency`, floored at one part
-per object), so peak read-ahead memory stays ≈ the configured total rather than
-×object-concurrency. If `maxBufferedBytes` is unset it falls back to
-`per-object-concurrency × partSize` (floored at the SDK's 50 MiB default). The
-custom runner streams straight to the sink and has no such client buffer.
-
-**Memory / OOM:** a large read-ahead budget (e.g. `maxBufferedBytes = 64GiB`) can
-be held resident during download, and in `both` mode it stacks on top of upload
-buffers. Both runners set Go's soft memory limit to 80% of system RAM (so the GC
-reclaims before the kernel OOM-kills the process) and free memory to the OS between
-phases. Even so, a 64 GiB budget is aggressive on a 128 GiB box — if you see the
-throughput collapse then a `Killed`, lower `maxBufferedBytes` (16–24 GiB still gives
-tens-to-hundreds of parts of read-ahead per object, far more than needed to
-saturate the link).
-
-Both runners accept `-progress` (default on): a live one-line indicator on stderr
-(cumulative bytes, instantaneous/average Gbps, in-flight). It only reads the shared
-atomic counters, so it has no measurable effect on throughput and stays out of the
-captured `summary.txt`. Disable with `-progress=false`.
-
-## Sweeps vs. captured runs
-
-In `both` mode (either runner) the phases run **upload first, then download**, but
-each phase is sampled and reported **independently** — its own throughput, its own
-resource table, and its own `*-sweep.json`. Nothing is averaged across phases.
-
-Two ways to run:
-
-- `run.sh <download|upload|both> [label]` — a **committable** run: writes the full
-  `results/runs/<stamp>[-label]/` directory (config, env, sweep JSON, summary, CSV,
-  SVG) and uploads it to S3. This is what you pull back and commit.
-- `sweep-download.sh` / `sweep-upload.sh` — a **scratch** run for quick iteration:
-  seeds (download) then benchmarks the whole size curve and drops a single
-  `results/<mode>-sweep-<stamp>.json` (git-ignored). Override tunables per run:
-
-  ```sh
-  WORKERS=16 CONCURRENCY=8 ITERATIONS=3 ./scripts/sweep-download.sh
-  DELIVERY=ordered-stream MAX_BUFFERED=64GiB ./scripts/sweep-download.sh   # compare modes
-  DELIVERY=file DELIVERY_PATH=/mnt/data ./scripts/sweep-download.sh
-  NO_CHECKSUM=1 ./scripts/sweep-download.sh    # checksum-validation off
-  NO_TLS=1 ./scripts/sweep-download.sh         # plaintext HTTP
-  PART_SIZE=64MiB ./scripts/sweep-upload.sh
-  ```
-
-## Run on EC2 c7gn.16xlarge (Graviton3, arm64, ~200 Gbps)
-
-You develop on Windows and build **on the instance**. S3 is the transport, so no
-SSH key handling is needed for the code itself.
-
-**1. Push source from Windows** (uses your AWS creds; syncs to `s3://<bucket>/<codePrefix>`):
-
-```powershell
-./scripts/push.ps1
-```
-
-**2. On the EC2 instance**, pull, build, tune once, and run:
-
-```sh
-# first time: fetch pull.sh however you like (git clone, scp, or aws s3 cp),
-# then it self-syncs the rest from S3 and builds with Go:
-./scripts/pull.sh                      # sync source from S3, install Go if absent, go build
-sudo ./scripts/tune-network.sh         # one-time: BBR, big buffers, initcwnd (persists; --revert to undo)
-./scripts/run.sh both spread-arm64     # download + upload sweeps -> results/runs/<stamp>-spread-arm64/
-```
-
-`run.sh` builds `./bench` on the host (Graviton/arm64), raises `ulimit -n`, runs
-the sweep, and — with `results.upload` set — the binary mirrors the whole run
-directory to `s3://<bucket>/results/runs/<stamp>[-label]/`.
-
-**3. Pull results back to Windows and commit:**
-
-```powershell
-./scripts/pull-results.ps1                      # just sync S3 -> results/runs/
-./scripts/pull-results.ps1 -Commit -Push        # sync, then git add/commit/push results/runs
-./scripts/pull-results.ps1 -Commit -Message "tm vs custom, aes128"
-```
-
-Both runners land under the same `results/runs/` prefix (custom runs contain
-`download-sweep.json` / `upload-sweep.json`; TM runs contain
-`tm-download-sweep.json` / `tm-upload-sweep.json`), so one `pull-results.ps1`
-syncs — and commits — everything. `-Commit` stages and commits only `results/runs/`,
-leaving your working changes untouched.
-
-Iterate by editing on Windows, re-running `push.ps1`, then `pull.sh && run.sh` on
-the host.
-
-The instance role must allow `s3:GetObject`/`HeadObject` (download),
-`s3:PutObject` + multipart actions (upload), `s3:GetObject`/`ListBucket` on the
-code prefix (pull), and `s3:PutObject` on the results prefix (`results.upload`).
 
 ## Config (`bench.config.json`)
 
-| key | meaning |
-|-----|---------|
-| `bucket` / `region` | target bucket and region |
-| `dataPrefix` | key prefix; keys are `<prefix><size>.bin` or `<prefix><size>-<i>.bin` |
-| `sizes` | `[{ "size": "30GiB", "count": 10 }]` |
-| `partSize` | part size for the buffer pool and multipart uploads (min 5MiB for upload) |
-| `download.workers` x `download.concurrency` | total parallel in-flight GETs |
-| `download.iterations` / `download.warmup` | measured vs. discarded passes |
-| `download.validateChecksum` | enable per-part CRC32 validation |
-| `download.spreadConnections` | fan sockets across all resolved S3 IPs |
-| `download.tls` | false = plaintext HTTP endpoint |
-| `download.deliveryMode` | where each part goes: `discard`, `ordered-stream`, or `file` (see below) |
-| `download.deliveryPath` | directory for `file` mode |
-| `download.maxBufferedBytes` | ordered-stream reorder-buffer cap (0 = bounded by parallelism x partSize) |
-| `download.maxRetries` | extra attempts per part on transient failure |
-| `download.stallTimeoutMs` | watchdog trips when no bytes move this long |
-| `upload.workers` x `upload.concurrency` | total parallel in-flight UploadParts |
-| `upload.keyPrefix` | prefix for uploaded objects (keeps seeded data safe) |
-| `upload.iterations` / `upload.warmup` / `upload.maxRetries` / `upload.stallTimeoutMs` | as above |
-| `sampling.enabled` / `sampling.intervalMs` | background RSS/CPU/in-flight/throughput sampling |
-| `results.dir` | local directory for the JSON report + SVG plot |
-| `results.plot` | render the time-series SVG |
-| `results.upload` | also upload report + plot to S3 |
-| `results.bucket` / `results.prefix` | destination for uploaded results (bucket defaults to `bucket`) |
+Top-level keys: `bucket`, `region`, `dataPrefix` (download data key prefix),
+`codePrefix` (S3 staging prefix for source), `sizes` (e.g.
+`[{ "size": "1024GiB", "count": 5 }]`), `partSize` (TM part / range size),
+`checksum`, `memoryLimit` (absolute Go soft memory limit, e.g. `"40GiB"`; empty =
+80% of RAM), `sampling`, `results`.
+
+Two Transfer Manager sections share the same shape: `transferManager` (baseline) and
+`tmOptimized` (optimized). Download knobs:
+
+```json
+"tmOptimized": {
+  "download": {
+    "api": "download-file",         // get | download-object | download-file
+    "getObjectType": "ranges",      // parts (PartNumber) | ranges (byte ranges of partSize)
+    "sink": "file",                 // discard | file  (download-object only)
+    "deliveryPath": "/mnt/stripe/output",
+    "objectConcurrency": 5,         // objects in parallel (0 = object count)
+    "concurrency": 640,             // per-object part concurrency (0 = SDK default)
+    "iterations": 1, "warmup": 0,
+    "validateChecksum": true,       // false -> DisableChecksumValidation (skip the CRC pass)
+    "maxBufferedBytes": 68719476736,// GetObject read-ahead total ("get" API only)
+    "multiNIC": true,               // round-robin source IP across ENIs (optimized only)
+    "verifyFullChecksum": false,    // untimed CRC32 re-read of written files (file sinks)
+    "directIOThreshold": "100MiB",  // download-file: use O_DIRECT above this object size
+    "disableDirectIO": false,       // download-file: force the buffered writer
+    "writeChunkSize": "8MiB",       // download-file: fixed disk-write chunk size
+    "writeFlushWorkers": 16,        // download-file: write-behind flush workers per file
+    "writeFlushQueueDepth": 64,     // download-file: write-behind queue depth
+    "disableWriteBufferPool": false // download-file: A/B pooled vs raw-malloc O_DIRECT buffers
+  },
+  "upload": { "objectConcurrency": 0, "concurrency": 640, "iterations": 1, "warmup": 0 }
+}
+```
+
+Most knobs have a `-flag` override for one-off runs: `-download-api`,
+`-get-object-type`, `-part-size`, `-concurrency`, `-object-concurrency`,
+`-delivery-path`, `-profile`.
+
+### The `DownloadFile` fork (optimized profile)
+
+O_DIRECT lives in the fork's `DownloadFile`, not in the benchmark. `DownloadFile`
+owns the destination writer: it downloads each object straight to a file under
+`deliveryPath`, using **O_DIRECT** for objects larger than `directIOThreshold`
+(Linux) and a buffered writer otherwise, and coalesces part/range data into fixed
+`writeChunkSize` writes behind a pool of `writeFlushWorkers` draining a
+`writeFlushQueueDepth` queue (write-behind — network receive is decoupled from the
+disk write). O_DIRECT bypasses the page cache; on XFS the shared inode lock lets the
+flush workers hit the stripe in parallel instead of serializing on the buffered
+single-inode write lock. Linux only; elsewhere it falls back to the buffered writer.
+
+The fork is a sibling checkout referenced by a `replace` in `go.mod`:
+
+```
+replace github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager => ../aws-sdk-go-v2/feature/s3/transfermanager
+```
+
+So on both your dev machine and the instance, check the fork out next to this repo
+(`../aws-sdk-go-v2`).
+
+### multiNIC (optimized profile)
+
+When `true`, the client round-robins each outbound connection's source IP across all
+of the host's ENI addresses, spreading load over multiple network cards. It requires
+host-side source policy routing — run `sudo ./scripts/setup-multinic.sh` first. On a
+single-NIC box it resolves to one IP and is a no-op.
+
+### Download read-ahead ("get" API only)
+
+The TM's `GetObject` reader fetches `GetObjectBufferSize / partSize` parts ahead of
+the consumer, defaulting to only 50 MiB. `tmbench` drives it from `maxBufferedBytes`
+(a total budget split across objects in flight). Only the `get` API uses this;
+`download-object` and `download-file` write parts to their offsets and have no such
+read-ahead budget.
+
+### Memory limit
+
+`memoryLimit` sets Go's soft memory limit (`GOMEMLIMIT`) to an absolute value; empty
+defaults to 80% of system RAM. Lower it to make the GC collect harder and hold peak
+RSS down (keep it above the live working set or the GC thrashes). `GOGC` is also
+honored from the environment.
+
+## Run on EC2
+
+You develop on Windows and build **on the instance**; S3 is the transport for the
+source, so no SSH key handling is needed for the code.
+
+1. **Push source from Windows** (syncs to `s3://<bucket>/<codePrefix>`):
+
+   ```powershell
+   ./scripts/push.ps1
+   ```
+
+2. **On the instance** — pull, build, tune once, seed, and run:
+
+   ```sh
+   ./scripts/pull.sh                       # sync source from S3, install Go if absent, build tmbench
+   sudo ./scripts/tune-network.sh          # one-time: BBR, big buffers, initcwnd (--revert to undo)
+   ./scripts/tm-run.sh seed                # idempotent data-prep (skips existing objects)
+   ./scripts/tm-run.sh both baseline       # upload then download (baseline profile)
+   ./scripts/tm-run.sh download df -profile optimized -download-api download-file -part-size 8MiB
+   ```
+
+   `tm-run.sh <mode> [label] [extra tmbench flags...]` builds `./tmbench`, raises
+   `ulimit -n`, runs, and — with `results.upload` set — mirrors the whole run
+   directory to `s3://<bucket>/results/runs/<stamp>[-label]/`.
+
+3. **Pull results back to Windows and commit:**
+
+   ```powershell
+   ./scripts/pull-results.ps1               # sync S3 -> results/runs/
+   ./scripts/pull-results.ps1 -Commit -Push # sync, then commit only results/runs/
+   ```
+
+The instance role must allow `s3:GetObject`/`HeadObject` (download + the seed
+skip-existing check), `s3:PutObject` + multipart actions (upload / seed),
+`s3:GetObject`/`ListBucket` on the code prefix (pull), and `s3:PutObject` on the
+results prefix (`results.upload`).
 
 ## Output
 
-Each run creates a run directory `results/runs/<YYYYMMDDThhmmss>[-label]/`. The
-custom and Transfer Manager runners use the same layout so their runs are directly
-comparable:
+Each run creates `results/runs/<YYYYMMDDThhmmss>[-label]/`:
 
 | file | contents |
 |------|----------|
 | `config.json` | snapshot of the config used for the run |
 | `env.txt` | host, Go/OS, CPU/mem, EC2 instance-type/AZ, key network sysctls |
-| `<mode>-sweep.json` | full results: `goVersion`/`sdkVersion`, resolved config, and per-group `samples`/`median`/`best`/`resources`/`partTimeStats`/`tlsInfo` |
-| `summary.txt` | captured console output (throughput + resource + per-part-time tables) |
-| `parttimes-<size>-<stamp>.csv` | per-part rows: `iter,key,part_number,bytes,<mode>_ms,vip,conn_id` |
+| `tm-<mode>-sweep.json` | results: `goVersion`/`sdkVersion`, resolved config, per-group `samples`/`median`/`best`/`resources` |
+| `summary.txt` | captured console output (throughput + resource tables) |
 | `<mode>.svg` | stacked time-series plot (throughput, RSS, in-flight, CPU) |
 
-Pass a label to group/compare runs:
-
-```sh
-./run.sh download spread-arm64      # -> results/runs/<stamp>-spread-arm64/
-go run ./cmd/bench -mode upload -label baseline
-```
-
-With `results.upload` the whole run directory is mirrored to
-`s3://<bucket>/results/runs/<stamp>[-label]/`.
-
-## Delivery modes and what they measure
-
-`download.deliveryMode` selects the sink each downloaded part is written to:
-
-| mode | what it does | memory profile |
-|------|--------------|----------------|
-| `discard` (default) | drain each part to `io.Discard`, count bytes; no ordering | low, flat (~100-200 MB) — nothing is buffered |
-| `ordered-stream` | reassemble parts in ascending order and deliver them as one consumable stream per object (see below), bounded by `maxBufferedBytes` | rises with the reorder window (roughly `maxBufferedBytes`) |
-| `file` | write each part to disk at its byte offset under `deliveryPath` (positional `WriteAt`) | low RSS, but adds disk-write throughput as the bottleneck/sink |
-
-This is why the resource table's memory % depends on the mode: in the default
-`discard` mode the process buffers almost nothing, so RSS (and MEM%) stay low even
-at full network throughput. Switch to `ordered-stream` to hold parts in memory for
-in-order delivery, or `file` to measure with a real disk sink.
-
-### ordered-stream is a real, consumable stream
-
-`ordered-stream` delivers each object as one in-order `io.Reader` (an
-`orderedReader`), exactly like the Transfer Manager's `GetObject` `Body` — so it's
-equally ergonomic for a real consumer (drop it into `io.Copy`, a decoder, a hasher,
-etc.). It also implements `io.WriterTo`, so `io.Copy` hands each pooled part buffer
-straight to the destination and recycles it with **no intermediate copy**. The TM's
-reader is `Read`-only, so `io.Copy` from it always copies through a temp buffer; the
-custom `ordered-stream` avoids that copy on the `io.Copy`/`WriterTo` path, so it can
-match or beat the TM while doing the same ordered-delivery work. The benchmark drains
-each object's reader with `io.Copy(io.Discard, reader)` — the same path a real
-consumer would drive.
-
-`CPU%` is normalized to "% of all cores" (100% = every vCPU saturated).
-
-## Feature status
-
-- [x] Upload benchmark (multipart PUT) with abort-on-error cleanup
-- [x] Ordered-stream delivery as a consumable `io.Reader`/`io.WriterTo` (`deliveryMode: ordered-stream`)
-- [x] Per-part timing percentiles (p50/p90/p99/p99.9) + front-end IP / conn-reuse capture
-- [x] Time-series RSS/CPU/in-flight sampling + SVG plot
-- [x] Stall watchdog + per-part retry
-- [x] Run capture + S3 upload of results
+A live one-line progress indicator prints to stderr during a run (`-progress`,
+default on): cumulative bytes, instantaneous/average Gbps, and in-flight count. It
+only reads shared atomic counters, so it has no measurable effect on throughput and
+stays out of the captured `summary.txt`.

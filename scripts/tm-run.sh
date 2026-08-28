@@ -5,10 +5,11 @@
 # buffer, download drains to /dev/null — no local files.
 #
 # Usage:
+#   ./scripts/tm-run.sh seed                 # idempotent data-prep (skips existing)
 #   ./scripts/tm-run.sh [both]     [label]   # DEFAULT: upload then download
 #   ./scripts/tm-run.sh download   [label]
 #   ./scripts/tm-run.sh upload     [label]
-#   ./scripts/tm-run.sh download my-label -concurrency 128   # extra flags pass through
+#   ./scripts/tm-run.sh download my-label -profile optimized -download-api download-file
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -18,9 +19,9 @@ shift || true
 shift || true # drop mode + optional label; remaining args pass through to tmbench
 
 case "$MODE" in
-  both | download | upload) ;;
+  seed | both | download | upload) ;;
   *)
-    echo "unknown mode '${MODE}' (use both | download | upload)" >&2
+    echo "unknown mode '${MODE}' (use seed | both | download | upload)" >&2
     exit 1
     ;;
 esac

@@ -14,7 +14,9 @@ package tmbench
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -26,6 +28,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 
 	"github.com/goabv/s3-benchmark-go/internal/bench"
 	"github.com/goabv/s3-benchmark-go/internal/config"
@@ -122,11 +126,67 @@ type countingSink interface {
 	written() int64
 }
 
-// closableSink is a countingSink that must be finalized (flush/truncate/close),
-// e.g. the O_DIRECT file sink. newDirectWriterAt returns one (Linux only).
-type closableSink interface {
-	countingSink
-	Close() error
+// RunSeed uploads the configured object sizes to the download data prefix
+// (cfg.KeysFor keys — the exact keys the download reads), skipping any object that
+// already exists, so the download benchmark has data to read. It uses HeadObject
+// (via the raw S3 client) to skip existing objects and the Transfer Manager's
+// UploadObject to write missing ones from a small repeating in-memory pattern (no
+// whole-object allocation). Idempotent and safe to re-run; it neither samples nor
+// produces a report.
+func RunSeed(ctx context.Context, tm *transfermanager.Client, s3c *s3.Client, cfg *config.Config, prog *metrics.Progress) error {
+	if prog == nil {
+		prog = &metrics.Progress{}
+	}
+	pattern := makePattern()
+	fmt.Printf("=== Seeding download data to s3://%s/%s ===\n", cfg.Bucket, cfg.DataPrefix)
+	for _, spec := range cfg.Sizes {
+		sizeBytes, err := config.ParseSize(spec.Size)
+		if err != nil {
+			return fmt.Errorf("parse size %q: %w", spec.Size, err)
+		}
+		for _, key := range cfg.KeysFor(spec) {
+			exists, err := objectExists(ctx, s3c, cfg.Bucket, key)
+			if err != nil {
+				return fmt.Errorf("head %q: %w", key, err)
+			}
+			if exists {
+				fmt.Printf("  skip (exists): %s\n", key)
+				continue
+			}
+			fmt.Printf("  seeding: %s (%s)\n", key, spec.Size)
+			atomic.AddInt64(&prog.InFlight, 1)
+			_, err = tm.UploadObject(ctx, &transfermanager.UploadObjectInput{
+				Bucket: aws.String(cfg.Bucket),
+				Key:    aws.String(key),
+				Body:   &sizedReader{remaining: sizeBytes, pattern: pattern, prog: prog},
+			})
+			atomic.AddInt64(&prog.InFlight, -1)
+			if err != nil {
+				return fmt.Errorf("seed %q: %w", key, err)
+			}
+		}
+	}
+	fmt.Printf("=== Seeding complete ===\n")
+	return nil
+}
+
+// objectExists reports whether an object is present via HeadObject.
+func objectExists(ctx context.Context, s3c *s3.Client, bucket, key string) (bool, error) {
+	_, err := s3c.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err == nil {
+		return true, nil
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NotFound", "NoSuchKey", "404":
+			return false, nil
+		}
+	}
+	return false, err
 }
 
 // RunUpload uploads `count` in-memory objects per size group via the Transfer
@@ -144,7 +204,11 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 	pattern := makePattern()
 
 	fmt.Printf("=== S3 Transfer Manager UPLOAD benchmark (feature/s3/transfermanager) ===\n")
-	fmt.Printf("region=%s  bucket=%s  keyPrefix=%s  source=memory\n", cfg.Region, cfg.Bucket, keyPrefix)
+	// Upload writes the SAME keys the download reads (cfg.KeysFor under dataPrefix),
+	// so an upload run seeds/round-trips the exact objects a later download fetches.
+	// The keyPrefix arg is retained for signature compatibility but no longer used.
+	_ = keyPrefix
+	fmt.Printf("region=%s  bucket=%s  keyPrefix=%s  source=memory\n", cfg.Region, cfg.Bucket, cfg.DataPrefix)
 	fmt.Printf("object-concurrency=%d  per-object part-concurrency=%d  ~parts-in-flight=%d  iterations=%d (warmup=%d)\n\n",
 		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, sec.Upload.Iterations, sec.Upload.Warmup)
 
@@ -158,6 +222,7 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 		if count < 1 {
 			count = 1
 		}
+		keys := cfg.KeysFor(spec) // upload to the exact keys the download will read
 
 		var samples []bench.Sample3
 		iters := sec.Upload.Warmup + sec.Upload.Iterations
@@ -165,7 +230,7 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 			var bytes int64
 			start := time.Now()
 			err := runObjectsParallel(ctx, objectConcurrency, count, func(i int) error {
-				key := fmt.Sprintf("%s%s-i%d-%d.bin", keyPrefix, sanitize(spec.Size), it, i)
+				key := keys[i] // matches cfg.KeysFor -> what RunDownload/RunDownloadObject read
 				atomic.AddInt64(&prog.InFlight, 1)
 				_, e := tm.UploadObject(ctx, &transfermanager.UploadObjectInput{
 					Bucket: aws.String(cfg.Bucket),
@@ -269,13 +334,12 @@ func RunDownload(ctx context.Context, tm *transfermanager.Client, cfg *config.Co
 // (bytes are counted for throughput, then dropped), so this measures the TM's
 // parallel-write ceiling. Objects transfer concurrently through a pool of
 // objectConcurrency; each object's parts run at perObjectConcurrency.
-func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prog *metrics.Progress, sec config.TransferManager, objectConcurrency, perObjectConcurrency int, getObjType types.GetObjectType, bufSz int64) (*bench.RunResult, error) {
+func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prog *metrics.Progress, sec config.TransferManager, objectConcurrency, perObjectConcurrency int, getObjType types.GetObjectType) (*bench.RunResult, error) {
 	if prog == nil {
 		prog = &metrics.Progress{}
 	}
 	toFile := sec.Download.Sink == "file"
 	deliveryPath := sec.Download.DeliveryPath
-	directIO := sec.Download.DirectIO
 	sinkDesc := "memory(discard WriterAt, parallel offsets)"
 	if toFile {
 		if deliveryPath == "" {
@@ -284,11 +348,16 @@ func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *con
 		if err := os.MkdirAll(deliveryPath, 0o755); err != nil {
 			return nil, fmt.Errorf("create deliveryPath %q: %w", deliveryPath, err)
 		}
-		if directIO {
-			sinkDesc = fmt.Sprintf("disk O_DIRECT (aligned direct writes under %s, removed after each object)", deliveryPath)
-		} else {
-			sinkDesc = fmt.Sprintf("disk buffered (WriterAt -> *os.File under %s, removed after each object)", deliveryPath)
+		// Start-of-run cleanup: remove any files left by a previous run so we begin
+		// from a clean disk. Downloaded files are intentionally NOT deleted at the
+		// end of a run — they persist for optional out-of-band CRC32 verification
+		// (see cmd/tmbench runPhase) and are cleared here on the next run.
+		for _, spec := range cfg.Sizes {
+			for _, key := range cfg.KeysFor(spec) {
+				_ = os.Remove(filepath.Join(deliveryPath, sanitize(key)))
+			}
 		}
+		sinkDesc = fmt.Sprintf("disk buffered (WriterAt -> *os.File under %s, cleaned at start of run)", deliveryPath)
 	}
 
 	fmt.Printf("=== S3 Transfer Manager DOWNLOAD benchmark (DownloadObject, WriterAt) ===\n")
@@ -315,21 +384,12 @@ func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *con
 				finalize := func() error { return nil }
 				if toFile {
 					path := filepath.Join(deliveryPath, sanitize(key))
-					if directIO {
-						dw, derr := newDirectWriterAt(path, bufSz, prog)
-						if derr != nil {
-							return derr
-						}
-						w = dw
-						finalize = func() error { e := dw.Close(); _ = os.Remove(path); return e }
-					} else {
-						f, ferr := os.Create(path)
-						if ferr != nil {
-							return fmt.Errorf("create %q: %w", path, ferr)
-						}
-						w = &countingWriterAt{w: f, prog: prog}
-						finalize = func() error { _ = f.Close(); _ = os.Remove(path); return nil }
+					f, ferr := os.Create(path)
+					if ferr != nil {
+						return fmt.Errorf("create %q: %w", path, ferr)
 					}
+					w = &countingWriterAt{w: f, prog: prog}
+					finalize = func() error { return f.Close() }
 				} else {
 					w = &discardWriterAt{prog: prog}
 				}
@@ -345,9 +405,8 @@ func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *con
 						o.GetObjectType = getObjType
 					}
 				})
-				// finalize() flushes/closes the sink (for O_DIRECT the tail write +
-				// truncate happen here) and must be inside the timed region so the
-				// to-disk cost is measured.
+				// finalize() closes the file and must be inside the timed region so
+				// the to-disk cost is measured.
 				ferr := finalize()
 				if e != nil {
 					return fmt.Errorf("DownloadObject %q: %w", key, e)
@@ -369,6 +428,153 @@ func RunDownloadObject(ctx context.Context, tm *transfermanager.Client, cfg *con
 		result.Groups = append(result.Groups, group(spec, perFileSize, len(keys), 0, objectConcurrency, perObjectConcurrency, samples, sec.Download.ValidateChecksum))
 	}
 	return result, nil
+}
+
+// RunDownloadFile benchmarks the SDK's DownloadFile API, where the transfer
+// manager owns the destination writer: each object is written to a file under
+// deliveryPath using O_DIRECT when larger than DirectIOThreshold (else a buffered
+// writer), coalescing part/range data into fixed WriteChunkSize disk writes.
+// Objects transfer concurrently through a pool of objectConcurrency; each object's
+// parts run at perObjectConcurrency. Unlike RunDownloadObject, the sink is internal
+// to the SDK, so live bytes are tracked via a progress listener.
+func RunDownloadFile(ctx context.Context, tm *transfermanager.Client, cfg *config.Config, prog *metrics.Progress, sec config.TransferManager, objectConcurrency, perObjectConcurrency int, getObjType types.GetObjectType, partSize int64) (*bench.RunResult, error) {
+	if prog == nil {
+		prog = &metrics.Progress{}
+	}
+	deliveryPath := sec.Download.DeliveryPath
+	if deliveryPath == "" {
+		deliveryPath = "."
+	}
+	if err := os.MkdirAll(deliveryPath, 0o755); err != nil {
+		return nil, fmt.Errorf("create deliveryPath %q: %w", deliveryPath, err)
+	}
+	// Start-of-run cleanup: clear files left by a previous run (see RunDownloadObject).
+	for _, spec := range cfg.Sizes {
+		for _, key := range cfg.KeysFor(spec) {
+			_ = os.Remove(filepath.Join(deliveryPath, sanitize(key)))
+		}
+	}
+
+	var directIOThreshold int64
+	if s := sec.Download.DirectIOThreshold; s != "" {
+		n, err := config.ParseSize(s)
+		if err != nil {
+			return nil, fmt.Errorf("parse directIOThreshold %q: %w", s, err)
+		}
+		directIOThreshold = n
+	}
+	var writeChunkSize int64
+	if s := sec.Download.WriteChunkSize; s != "" {
+		n, err := config.ParseSize(s)
+		if err != nil {
+			return nil, fmt.Errorf("parse writeChunkSize %q: %w", s, err)
+		}
+		writeChunkSize = n
+	}
+	// Effective write-behind flush pool sizing (mirrors the SDK defaults so the
+	// header shows what actually runs).
+	flushWorkers := sec.Download.WriteFlushWorkers
+	if flushWorkers <= 0 {
+		flushWorkers = 16
+	}
+	flushQueue := sec.Download.WriteFlushQueueDepth
+	if flushQueue <= 0 {
+		flushQueue = 64
+	}
+
+	writeMode := "O_DIRECT > threshold, buffered otherwise (SDK-managed)"
+	if sec.Download.DisableDirectIO {
+		writeMode = "buffered (O_DIRECT disabled)"
+	}
+	pooling := "pooled region buffers"
+	if sec.Download.DisableWriteBufferPool {
+		pooling = "non-pooled region buffers"
+	}
+	fmt.Printf("=== S3 Transfer Manager DOWNLOAD benchmark (DownloadFile, SDK-owned file sink) ===\n")
+	fmt.Printf("region=%s  bucket=%s  deliveryPath=%s  get-object-type=%s  write=%s  %s\n", cfg.Region, cfg.Bucket, deliveryPath, getObjType, writeMode, pooling)
+	fmt.Printf("object-concurrency=%d  per-object part-concurrency=%d  ~parts-in-flight=%d  flush-workers=%d  flush-queue=%d  iterations=%d (warmup=%d)\n\n",
+		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, flushWorkers, flushQueue, sec.Download.Iterations, sec.Download.Warmup)
+
+	result := &bench.RunResult{Mode: "tm-download"}
+	for _, spec := range cfg.Sizes {
+		keys := cfg.KeysFor(spec)
+		perFileSize, _ := config.ParseSize(spec.Size)
+
+		var samples []bench.Sample3
+		iters := sec.Download.Warmup + sec.Download.Iterations
+		for it := 0; it < iters; it++ {
+			var bytes int64
+			start := time.Now()
+			err := runObjectsParallel(ctx, objectConcurrency, len(keys), func(i int) error {
+				key := keys[i]
+				atomic.AddInt64(&prog.InFlight, 1)
+				defer atomic.AddInt64(&prog.InFlight, -1)
+
+				listener := &progBytesListener{prog: prog}
+				out, e := tm.DownloadFile(ctx, &transfermanager.DownloadFileInput{
+					Bucket:   aws.String(cfg.Bucket),
+					Key:      aws.String(key),
+					FilePath: filepath.Join(deliveryPath, sanitize(key)),
+				}, func(o *transfermanager.Options) {
+					o.Concurrency = perObjectConcurrency
+					o.DisableChecksumValidation = !sec.Download.ValidateChecksum
+					if partSize > 0 {
+						o.PartSizeBytes = partSize
+					}
+					if getObjType != "" {
+						o.GetObjectType = getObjType
+					}
+					o.DisableDirectIO = sec.Download.DisableDirectIO
+					if directIOThreshold > 0 {
+						o.DirectIOThreshold = directIOThreshold
+					}
+					if writeChunkSize > 0 {
+						o.WriteChunkSizeBytes = writeChunkSize
+					}
+					o.WriteFlushWorkers = flushWorkers
+					o.WriteFlushQueueDepth = flushQueue
+					o.DisableWriteBufferPool = sec.Download.DisableWriteBufferPool
+					o.ObjectProgressListeners.Register(listener)
+				})
+				if e != nil {
+					return fmt.Errorf("DownloadFile %q: %w", key, e)
+				}
+				atomic.AddInt64(&bytes, aws.ToInt64(out.ContentLength))
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+			if it >= sec.Download.Warmup {
+				samples = append(samples, sample3(bytes, time.Since(start)))
+			}
+		}
+
+		result.Groups = append(result.Groups, group(spec, perFileSize, len(keys), 0, objectConcurrency, perObjectConcurrency, samples, sec.Download.ValidateChecksum))
+	}
+	return result, nil
+}
+
+// progBytesListener feeds the SDK's per-object cumulative byte-transfer events into
+// the benchmark's live prog.Bytes counter. It tracks the max cumulative seen for its
+// object and adds only positive deltas, so concurrent/out-of-order part events never
+// double-count or move backwards. One instance is registered per object.
+type progBytesListener struct {
+	prog *metrics.Progress
+	last atomic.Int64
+}
+
+func (l *progBytesListener) OnObjectBytesTransferred(ctx context.Context, e *transfermanager.ObjectBytesTransferredEvent) {
+	for {
+		old := l.last.Load()
+		if e.BytesTransferred <= old {
+			return
+		}
+		if l.last.CompareAndSwap(old, e.BytesTransferred) {
+			atomic.AddInt64(&l.prog.Bytes, e.BytesTransferred-old)
+			return
+		}
+	}
 }
 
 // runObjectsParallel runs fn(0..n-1) across a pool of `workers` goroutines,
@@ -468,6 +674,42 @@ func bestSample(ss []bench.Sample3) bench.Sample3 {
 	return b
 }
 
+// VerifyDownloadedFiles re-reads each downloaded file (cfg.KeysFor under
+// deliveryPath) and checks its full-object CRC-32 against the expected data
+// pattern. It is meant to run OUTSIDE the sampled/timed region (see
+// cmd/tmbench runPhase), so its cost is never counted in throughput or resource
+// stats. It does NOT delete the files — start-of-run cleanup owns deletion.
+//
+// Verification is serial and reads every byte back from disk, so it can take a
+// while for large objects; that is why it defaults off and is opt-in via the
+// download.verifyFullChecksum config flag.
+func VerifyDownloadedFiles(cfg *config.Config, deliveryPath string) {
+	if deliveryPath == "" {
+		deliveryPath = "."
+	}
+	for _, spec := range cfg.Sizes {
+		size, err := config.ParseSize(spec.Size)
+		if err != nil {
+			fmt.Printf("  [verify] size %q: parse error: %v\n", spec.Size, err)
+			continue
+		}
+		want := expectedPatternCRC32(size)
+		for _, key := range cfg.KeysFor(spec) {
+			path := filepath.Join(deliveryPath, sanitize(key))
+			fmt.Printf("  [verify] %s: hashing %d bytes ...\n", key, size)
+			got, cerr := fileCRC32IEEE(path)
+			switch {
+			case cerr != nil:
+				fmt.Printf("  [verify] %s: read error: %v\n", key, cerr)
+			case got == want:
+				fmt.Printf("  [verify] %s: CRC32 OK (0x%08x over %d bytes)\n", key, got, size)
+			default:
+				fmt.Printf("  [verify] %s: CRC32 MISMATCH got=0x%08x want=0x%08x\n", key, got, want)
+			}
+		}
+	}
+}
+
 func sanitize(s string) string {
 	out := make([]byte, 0, len(s))
 	for _, c := range []byte(s) {
@@ -479,4 +721,53 @@ func sanitize(s string) string {
 		}
 	}
 	return string(out)
+}
+
+// fileCRC32IEEE reads the whole file at path and returns its CRC-32 (IEEE)
+// checksum over the entire contents. Used by VerifyDownloadedFiles (the untimed,
+// out-of-phase full-object verification) to confirm the object landed on disk intact.
+func fileCRC32IEEE(path string) (uint32, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	h := crc32.NewIEEE()
+	buf := make([]byte, 8<<20)
+	for {
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			h.Write(buf[:n])
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return 0, rerr
+		}
+	}
+	return h.Sum32(), nil
+}
+
+// expectedPatternCRC32 returns the CRC-32 (IEEE) of `size` bytes of the upload
+// data pattern (byte(offset*31)), matching makePattern and the seeder. Because
+// the pattern is continuous across the whole object (its 256-byte period divides
+// every part/tile size), this reproduces the exact bytes a correct download
+// should have written — without a second download.
+func expectedPatternCRC32(size int64) uint32 {
+	tile := make([]byte, 1<<20) // 1 MiB = whole number of 256-byte pattern periods
+	for i := range tile {
+		tile[i] = byte(i * 31)
+	}
+	h := crc32.NewIEEE()
+	remaining := size
+	for remaining > 0 {
+		n := int64(len(tile))
+		if n > remaining {
+			n = remaining
+		}
+		h.Write(tile[:n])
+		remaining -= n
+	}
+	return h.Sum32()
 }

@@ -11,7 +11,8 @@
 // selects what to run.
 //
 // -profile selects the config section: baseline (transferManager, the pristine TM
-// baseline) or optimized (tmOptimized, which carries mods like directIO / O_DIRECT).
+// baseline) or optimized (tmOptimized, which carries mods like multiNIC and the
+// DownloadFile O_DIRECT controls).
 //
 // Usage:
 //
@@ -47,7 +48,7 @@ import (
 
 func main() {
 	cfgPath := flag.String("config", "bench.config.json", "path to bench config JSON")
-	mode := flag.String("mode", "download", "benchmark mode: upload | download | both (both = upload then download, reported separately)")
+	mode := flag.String("mode", "download", "benchmark mode: seed | upload | download | both (seed = idempotent data-prep; both = upload then download, reported separately)")
 	region := flag.String("region", "", "override region")
 	bucket := flag.String("bucket", "", "override bucket")
 	label := flag.String("label", "", "optional run label (appended to the run directory name)")
@@ -88,9 +89,9 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 	}
 
 	// Select the profile's config section: baseline (pristine TM) or optimized
-	// (carries mods like directIO). The section is the source of truth; flags
-	// override in place (empty/0 = keep the config value), so the captured report
-	// reflects what ran.
+	// (carries mods like multiNIC and the DownloadFile O_DIRECT controls). The
+	// section is the source of truth; flags override in place (empty/0 = keep the
+	// config value), so the captured report reflects what ran.
 	var sel *config.TransferManager
 	switch profile {
 	case "baseline":
@@ -127,28 +128,42 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 	}
 
 	// Bound RSS so a large GetObject read-ahead buffer can't get the process
-	// OOM-killed; the GC reclaims harder as it nears the limit.
-	if lim := metrics.ApplyMemoryLimit(0.80); lim > 0 {
+	// OOM-killed; the GC reclaims harder as it nears the limit. An absolute
+	// config.MemoryLimit (e.g. "40GiB") wins when set; otherwise default to 80% of
+	// system RAM.
+	if cfg.MemoryLimit != "" {
+		n, err := config.ParseSize(cfg.MemoryLimit)
+		if err != nil {
+			return fmt.Errorf("parse memoryLimit %q: %w", cfg.MemoryLimit, err)
+		}
+		if lim := metrics.SetMemoryLimit(n); lim > 0 {
+			fmt.Fprintf(os.Stderr, "soft memory limit: %s (config memoryLimit)\n", humanBytes(lim))
+		}
+	} else if lim := metrics.ApplyMemoryLimit(0.80); lim > 0 {
 		fmt.Fprintf(os.Stderr, "soft memory limit: %s (80%% of RAM)\n", humanBytes(lim))
 	}
 
 	switch mode {
-	case "upload", "download", "both":
+	case "upload", "download", "both", "seed":
 	default:
-		return fmt.Errorf("unknown mode %q (supported: upload, download, both)", mode)
+		return fmt.Errorf("unknown mode %q (supported: seed, upload, download, both)", mode)
 	}
 	switch tmd.API {
-	case "get", "download-object":
+	case "get", "download-object", "download-file":
 	default:
-		return fmt.Errorf("unknown transferManager.download.api %q (want get | download-object)", tmd.API)
+		return fmt.Errorf("unknown transferManager.download.api %q (want get | download-object | download-file)", tmd.API)
 	}
 	switch tmd.Sink {
 	case "discard", "file":
 	default:
 		return fmt.Errorf("unknown transferManager.download.sink %q (want discard | file)", tmd.Sink)
 	}
-	if tmd.Sink == "file" && tmd.API != "download-object" {
-		return fmt.Errorf("transferManager.download.sink=file requires api=download-object")
+	if tmd.Sink == "file" && tmd.API != "download-object" && tmd.API != "download-file" {
+		return fmt.Errorf("transferManager.download.sink=file requires api=download-object or download-file")
+	}
+	// download-file always writes to DeliveryPath (the SDK owns the file sink).
+	if tmd.API == "download-file" && tmd.DeliveryPath == "" {
+		return fmt.Errorf("transferManager.download.api=download-file requires deliveryPath")
 	}
 	var tmGetObjType types.GetObjectType
 	switch tmd.GetObjectType {
@@ -218,6 +233,12 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 			humanBytes(tmd.MaxBufferedBytes), dlObjConc, humanBytes(dlGetBuffer), dlGetBuffer/max64(tmPartSize, 1))
 	}
 
+	// "seed" is pure data-prep: upload the configured sizes to the download keys,
+	// skipping existing objects. No sampler/watchdog/report.
+	if mode == "seed" {
+		return tmbench.RunSeed(ctx, tm, s3c, cfg, &metrics.Progress{})
+	}
+
 	// "both" runs upload first, then download — each sampled and reported
 	// independently so the numbers never mix.
 	phases := phasesFor(mode, ctx, tm, cfg, *sel, upKeyPrefix, tmGetObjType, upObjConc, upPerObjConc, dlObjConc, dlPerObjConc, dlGetBuffer, tmPartSize)
@@ -271,6 +292,10 @@ func run(cfgPath, mode, region, bucket, label string, concurrency, objectConc in
 type phase struct {
 	name string
 	fn   func(prog *metrics.Progress) (*bench.RunResult, error)
+	// verify, if set, runs AFTER the sampler/printer are stopped (i.e. outside
+	// the sampled region), e.g. a full-object CRC32 check. Its cost is never
+	// counted in throughput or resource stats.
+	verify func()
 }
 
 // phasesFor expands a mode into ordered phases. "both" is upload then download.
@@ -278,15 +303,28 @@ type phase struct {
 // per config section.
 func phasesFor(mode string, ctx context.Context, tm *transfermanager.Client, cfg *config.Config, sec config.TransferManager, upKeyPrefix string, getObjType types.GetObjectType,
 	upObjConc, upPerObjConc, dlObjConc, dlPerObjConc int, dlGetBuffer, bufSz int64) []phase {
-	upload := phase{"tm-upload", func(p *metrics.Progress) (*bench.RunResult, error) {
+	upload := phase{name: "tm-upload", fn: func(p *metrics.Progress) (*bench.RunResult, error) {
 		return tmbench.RunUpload(ctx, tm, cfg, p, sec, upKeyPrefix, upObjConc, upPerObjConc)
 	}}
-	download := phase{"tm-download", func(p *metrics.Progress) (*bench.RunResult, error) {
-		if sec.Download.API == "download-object" {
-			return tmbench.RunDownloadObject(ctx, tm, cfg, p, sec, dlObjConc, dlPerObjConc, getObjType, bufSz)
+	download := phase{name: "tm-download", fn: func(p *metrics.Progress) (*bench.RunResult, error) {
+		switch sec.Download.API {
+		case "download-object":
+			return tmbench.RunDownloadObject(ctx, tm, cfg, p, sec, dlObjConc, dlPerObjConc, getObjType)
+		case "download-file":
+			return tmbench.RunDownloadFile(ctx, tm, cfg, p, sec, dlObjConc, dlPerObjConc, getObjType, bufSz)
+		default:
+			return tmbench.RunDownload(ctx, tm, cfg, p, sec, dlObjConc, dlPerObjConc, dlGetBuffer, getObjType)
 		}
-		return tmbench.RunDownload(ctx, tm, cfg, p, sec, dlObjConc, dlPerObjConc, dlGetBuffer, getObjType)
 	}}
+	// Full-object CRC32 verification runs OUTSIDE the sampled region (see runPhase):
+	// only when files were written to disk, and only when explicitly enabled
+	// (default off). Its cost is never counted in throughput/resource stats, and it
+	// does not delete the files (start-of-run cleanup owns deletion).
+	writesFiles := (sec.Download.API == "download-object" && sec.Download.Sink == "file") || sec.Download.API == "download-file"
+	if writesFiles && sec.Download.VerifyFullChecksum {
+		dp := sec.Download.DeliveryPath
+		download.verify = func() { tmbench.VerifyDownloadedFiles(cfg, dp) }
+	}
 	switch mode {
 	case "upload":
 		return []phase{upload}
@@ -347,6 +385,12 @@ func runPhase(ctx context.Context, cfg *config.Config, ph phase, progress bool) 
 	fmt.Print(tables)
 	if stalls > 0 {
 		fmt.Printf("\nwarning: %d stall event(s) during %s\n", stalls, ph.name)
+	}
+	// Verification (if any) runs here — the sampler and progress printer are already
+	// stopped, so its cost is excluded from throughput and resource stats.
+	if ph.verify != nil {
+		fmt.Printf("\n>> verifying downloaded files (untimed, outside the sampled run) ...\n")
+		ph.verify()
 	}
 	return rr, samples, stalls, console + tables, nil
 }

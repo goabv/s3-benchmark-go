@@ -31,9 +31,14 @@ cd "$DEST"
 
 # Install Go if it's not already on the box (Amazon Linux 2023, arm64/Graviton).
 if ! command -v go >/dev/null 2>&1; then
-  echo "Go not found; installing the latest stable for linux/arm64 ..."
+  case "$(uname -m)" in
+    x86_64) GOARCH=amd64 ;;
+    aarch64 | arm64) GOARCH=arm64 ;;
+    *) GOARCH=amd64 ;;
+  esac
+  echo "Go not found; installing the latest stable for linux/${GOARCH} ..."
   GO_VER="$(curl -fsSL https://go.dev/VERSION?m=text | head -n1)"
-  curl -fsSL "https://go.dev/dl/${GO_VER}.linux-arm64.tar.gz" -o /tmp/go.tgz
+  curl -fsSL "https://go.dev/dl/${GO_VER}.linux-${GOARCH}.tar.gz" -o /tmp/go.tgz
   sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf /tmp/go.tgz
   export PATH="$PATH:/usr/local/go/bin"
   if ! grep -q '/usr/local/go/bin' "$HOME/.bashrc" 2>/dev/null; then
@@ -42,15 +47,13 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 
 echo "Building with $(go version) ..."
-CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bench ./cmd/bench
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o tmbench ./cmd/tmbench
 
 # S3 sync doesn't preserve executable bits; restore them so ./scripts/*.sh run.
 chmod +x scripts/*.sh 2>/dev/null || true
 
 echo "Ready in ${DEST}. All settings live in bench.config.json. Examples:"
-echo "  sudo ./scripts/tune-network.sh      # one-time network tuning (persists)"
-echo "  ./scripts/run.sh both               # custom runner: download + upload sweeps"
-echo "  ./scripts/run.sh download spread    # custom download sweep, labelled 'spread'"
-echo "  ./scripts/tm-run.sh both            # Transfer Manager baseline (in-memory)"
-echo "  ./scripts/tm-run.sh download -concurrency 128"
+echo "  sudo ./scripts/tune-network.sh          # one-time network tuning (persists)"
+echo "  ./scripts/tm-run.sh seed                # idempotent data-prep (skips existing)"
+echo "  ./scripts/tm-run.sh both baseline       # upload then download (baseline profile)"
+echo "  ./scripts/tm-run.sh download df -profile optimized -download-api download-file"

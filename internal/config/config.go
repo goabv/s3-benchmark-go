@@ -80,16 +80,41 @@ type TMDownload struct {
 	ValidateChecksum  bool   `json:"validateChecksum"`
 	MaxBufferedBytes  int64  `json:"maxBufferedBytes"` // GetObject read-ahead ("get" API only)
 	StallTimeoutMs    int    `json:"stallTimeoutMs"`
-	// DirectIO (optimized profile only) writes the file sink with O_DIRECT,
-	// bypassing the page cache so concurrent part-writers hit the disk in parallel
-	// instead of serializing on the buffered single-inode write path. Baseline
-	// leaves this false.
-	DirectIO bool `json:"directIO"`
 	// MultiNIC (optimized profile only) round-robins outbound connections across
 	// all of the host's ENI source IPs to spread load over multiple network cards.
 	// Requires host-side policy routing (scripts/setup-multinic.sh). Baseline
 	// leaves this false.
 	MultiNIC bool `json:"multiNIC"`
+	// VerifyFullChecksum (file sink only) re-reads each fully-downloaded file and
+	// checks its CRC-32 over the ENTIRE object before deleting it. This read-back
+	// + hash runs AFTER the timed region, so it never counts toward the measured
+	// download throughput. Baseline leaves this false.
+	VerifyFullChecksum bool `json:"verifyFullChecksum"`
+	// DirectIOThreshold (api=download-file only) is the object-size threshold, e.g.
+	// "100MiB", above which the SDK's DownloadFile writes with O_DIRECT; smaller
+	// objects use a buffered writer. Empty uses the SDK default (100 MiB).
+	DirectIOThreshold string `json:"directIOThreshold"`
+
+	// DisableDirectIO (api=download-file only) forces the SDK's DownloadFile to use
+	// the buffered writer regardless of object size (for A/B vs O_DIRECT).
+	DisableDirectIO bool `json:"disableDirectIO"`
+
+	// WriteChunkSize (api=download-file only) is the fixed disk-write chunk size,
+	// e.g. "8MiB", the SDK coalesces part/range data into, independent of the
+	// download range/part size. Empty uses the SDK default (8 MiB).
+	WriteChunkSize string `json:"writeChunkSize"`
+
+	// WriteFlushWorkers (api=download-file only) is the number of write-behind flush
+	// goroutines per file in the SDK's DownloadFile sink. 0 uses the SDK default (16).
+	WriteFlushWorkers int `json:"writeFlushWorkers"`
+
+	// WriteFlushQueueDepth (api=download-file only) is the depth of the bounded queue
+	// feeding the DownloadFile flush workers. 0 uses the SDK default (64).
+	WriteFlushQueueDepth int `json:"writeFlushQueueDepth"`
+
+	// DisableWriteBufferPool (api=download-file only) turns off O_DIRECT region-buffer
+	// pooling in the SDK's DownloadFile sink (A/B pooled vs raw-malloc).
+	DisableWriteBufferPool bool `json:"disableWriteBufferPool"`
 }
 
 // StallTimeout returns the TM download stall-watchdog timeout.
@@ -122,7 +147,7 @@ type TransferManager struct {
 
 // applyTMDefaults fills unset fields of a Transfer Manager section (baseline or
 // optimized) with defaults. ObjectConcurrency/Concurrency are intentionally left
-// at 0 ("auto"), and DirectIO defaults to false.
+// at 0 ("auto").
 func applyTMDefaults(tm *TransferManager) {
 	d := &tm.Download
 	if d.API == "" {
@@ -173,19 +198,26 @@ type Results struct {
 
 // Config is the whole bench.config.json.
 type Config struct {
-	Bucket          string          `json:"bucket"`
-	Region          string          `json:"region"`
-	DataPrefix      string          `json:"dataPrefix"`
-	CodePrefix      string          `json:"codePrefix"`
-	Sizes           []SizeSpec      `json:"sizes"`
-	PartSize        string          `json:"partSize"`
-	Checksum        string          `json:"checksum"`
+	Bucket     string     `json:"bucket"`
+	Region     string     `json:"region"`
+	DataPrefix string     `json:"dataPrefix"`
+	CodePrefix string     `json:"codePrefix"`
+	Sizes      []SizeSpec `json:"sizes"`
+	PartSize   string     `json:"partSize"`
+	Checksum   string     `json:"checksum"`
+	// MemoryLimit sets Go's soft memory limit (GOMEMLIMIT equivalent) as an
+	// absolute value, e.g. "40GiB". Empty = default (80% of system RAM). Lower it
+	// to force the GC to collect harder and hold peak RSS down; keep it above the
+	// live working set (objectConcurrency x concurrency x region size) or the GC
+	// will thrash.
+	MemoryLimit     string          `json:"memoryLimit"`
 	Download        Download        `json:"download"`
 	Upload          Upload          `json:"upload"`
 	TransferManager TransferManager `json:"transferManager"`
 	// TMOptimized is the "optimized" TM profile (cmd/tmbench -profile optimized):
-	// same shape as TransferManager but carries the optimization knobs (e.g.
-	// DirectIO). transferManager stays the pristine baseline; all mods live here.
+	// same shape as TransferManager but carries the optimization knobs (multiNIC,
+	// the DownloadFile O_DIRECT controls). transferManager stays the pristine
+	// baseline; all mods live here.
 	TMOptimized TransferManager `json:"tmOptimized"`
 	Sampling    Sampling        `json:"sampling"`
 	Results     Results         `json:"results"`

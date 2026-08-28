@@ -3,9 +3,10 @@
   "region": "us-west-2",
   "dataPrefix": "bench/",
   "codePrefix": "code-go/",
-  "sizes": [{ "size": "200GiB", "count": 1 }],
-  "partSize": "32MiB",
+  "sizes": [{ "size": "1024GiB", "count": 5 }],
+  "partSize": "8MiB",
   "checksum": "CRC32",
+  "memoryLimit": "50GiB",
 
   "download": {
     "workers": 64,
@@ -36,18 +37,18 @@
     "download": {
       "api": "download-object",
       "getObjectType": "parts",
-      "sink": "discard",
+      "sink": "file",
       "deliveryPath": "/mnt/stripe/output",
-      "objectConcurrency": 0,
+      "objectConcurrency": 5,
       "concurrency": 640,
       "iterations": 1,
-      "warmup": 1,
+      "warmup": 0,
       "validateChecksum": true,
       "maxBufferedBytes": 68719476736,
       "stallTimeoutMs": 30000
     },
     "upload": {
-      "objectConcurrency": 0,
+      "objectConcurrency": 5,
       "concurrency": 640,
       "iterations": 1,
       "warmup": 0,
@@ -58,19 +59,25 @@
 
   "tmOptimized": {
     "download": {
-      "api": "download-object",
-      "getObjectType": "parts",
+      "api": "download-file",
+      "getObjectType": "ranges",
       "sink": "file",
       "deliveryPath": "/mnt/stripe/output",
-      "objectConcurrency": 0,
+      "objectConcurrency": 5,
       "concurrency": 640,
       "iterations": 1,
       "warmup": 0,
       "validateChecksum": true,
       "maxBufferedBytes": 68719476736,
       "stallTimeoutMs": 30000,
-      "directIO": true,
-      "multiNIC": true
+      "multiNIC": true,
+      "verifyFullChecksum": false,
+      "directIOThreshold": "100MiB",
+      "disableDirectIO": false,
+      "writeChunkSize": "8MiB",
+      "writeFlushWorkers": 16,
+      "writeFlushQueueDepth": 64,
+      "disableWriteBufferPool": false
     },
     "upload": {
       "objectConcurrency": 0,
