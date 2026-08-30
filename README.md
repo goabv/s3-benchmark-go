@@ -125,6 +125,58 @@ replace github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager => ../aws-sdk-go
 So on both your dev machine and the instance, check the fork out next to this repo
 (`../aws-sdk-go-v2`).
 
+### `download-file` code flow
+
+The path a `download-file` run takes, from the benchmark runner into the fork and
+down to disk. The network side (`GetObject` → `io.Copy`) and the disk side
+(`WriteAt` → flush pool → `pwrite`) run concurrently and decoupled through the
+bounded flush queue; the two repos meet at the single `tm.DownloadFile` call
+(wired by the `replace` directive above).
+
+**A. Benchmark runner sets up** (this repo, `s3-benchmark-go`):
+
+1. `scripts/tm-run.sh download <label> -profile optimized` → `./tmbench -mode download -profile optimized`.
+2. `cmd/tmbench/main.go run()` — `-profile optimized` selects the `tmOptimized` config section, validates `api=download-file` (requires `deliveryPath`), applies `memoryLimit`, builds the tuned S3 client (`s3client.New`, multi-NIC if set) and the TM client (`transfermanager.New`, `PartSizeBytes=partSize`).
+3. `phasesFor()` dispatches the download phase on `api` → `tmbench.RunDownloadFile(...)`.
+4. `runPhase()` wraps it with the sampler / stall watchdog / progress printer (they read `prog.Bytes`/`InFlight`) and times it.
+5. `internal/tmbench/tmbench.go RunDownloadFile()` — mkdir + start-of-run cleanup, then per iteration `runObjectsParallel(objectConcurrency, keys)`: each object goroutine registers a `progBytesListener` and calls **`tm.DownloadFile(&DownloadFileInput{Bucket, Key, FilePath}, opts...)`**, where `opts` set `Concurrency`, `PartSizeBytes`, `GetObjectType`, and the O_DIRECT knobs (`DirectIOThreshold`, `WriteChunkSizeBytes`, `WriteFlushWorkers`, `WriteFlushQueueDepth`, `DisableWriteBufferPool`). Adds `out.ContentLength` to the sample.
+
+**B. Fork sets up the sink** (`aws-sdk-go-v2`, via the `replace`):
+
+6. `api_op_DownloadFile.go Client.DownloadFile()` — copies+applies options, `downloadFileObjectSize()` does a `HeadObject` to learn the size, then `newFileSink(path, size, opts)`.
+7. `downloadfile_sink.go newFileSink()` — size > `DirectIOThreshold` and Linux → `newDirectChunkSink()` (`downloadfile_directsink_linux.go`): opens `O_DIRECT`, builds `directBackend`, wraps in `newChunkedWriterAt(backend, chunkSize, flushWorkers, queueDepth)` which **spawns the flush-worker goroutines**.
+8. `DownloadFile` builds a `DownloadObjectInput` with `WriterAt: sink` and runs the shared engine `downloader.download(ctx)`.
+
+**C. Shared download engine** (the same code `DownloadObject` uses):
+
+9. `api_op_DownloadObject.go downloader.download()` — RANGE mode: fetches the first range to learn total size, spawns `Concurrency` part-worker goroutines, feeds `dlChunk{w: sink, withRange}` advancing by `PartSizeBytes` (8 MiB ranges).
+10. `downloadPart → tryDownloadChunk`: `GetObject` with a `Range` header → `io.Copy(chunk, out.Body)` (stdlib 32 KiB buffer; TLS delivers ~16 KiB reads) → `(*dlChunk).Write` → `sink.WriteAt(p, off)`. Bytes-transferred events fire the `progBytesListener` → live `prog.Bytes`.
+
+**D. Write-behind sink** (fork):
+
+11. `downloadfile_sink.go chunkedWriterAt.WriteAt()` — coalesces the ~16 KiB writes into fixed `writeChunkSize` (8 MiB) regions, keyed by `offset/chunkSize` in a 256-shard map. When a region fills it hands a `flushJob` to the bounded `jobs` channel (depth `writeFlushQueueDepth`), blocking if full (backpressure); it never does the disk write on the part-worker goroutine.
+12. `flushLoop()` (`writeFlushWorkers` goroutines) drains `jobs` → `directBackend.writeRegion()`: block-round the length (zero-pad the tail) → `pwriteFull()` = `syscall.Pwrite` on the raw O_DIRECT fd (bypasses `os.File`'s per-fd lock so concurrent aligned writes to disjoint offsets run in parallel, DMA straight to the stripe). Then recycles the buffer to the pool.
+
+**E. Finalize:**
+
+13. After `download()` returns, `DownloadFile` calls `sink.Close()` (`chunkedWriterAt.Close`): enqueue the trailing partial region, close `jobs`, `wg.Wait()` the flush workers, then `directBackend.finalize()`: `Truncate(size)` (chop O_DIRECT block padding to the exact object size) → `syscall.Fdatasync(fd)` (durability flush) → `Close`.
+14. `DownloadFile` returns `out` (`ContentLength` = bytes written); `RunDownloadFile` records the sample; `runPhase` renders the tables; `main.go` writes `results/runs/<stamp>-<label>/`.
+
+Compact call chain:
+
+```
+tm-run.sh
+└─ tmbench/main.go run() → phasesFor() → RunDownloadFile()            [benchmark]
+   └─ tm.DownloadFile()                                              [fork ── via go.mod replace]
+      ├─ downloadFileObjectSize() → HeadObject
+      ├─ newFileSink() → newDirectChunkSink() → newChunkedWriterAt() [spawns flush workers]
+      └─ downloader.download()                                       [shared engine]
+         └─ N× downloadPart → GetObject(Range) → io.Copy → dlChunk.Write → sink.WriteAt()
+            └─ chunkedWriterAt: coalesce → 8MiB region → jobs chan
+               └─ flushLoop ×W → directBackend.writeRegion → syscall.Pwrite (O_DIRECT)
+      └─ sink.Close() → drain → Truncate → Fdatasync → Close
+```
+
 ### multiNIC (optimized profile)
 
 When `true`, the client round-robins each outbound connection's source IP across all
