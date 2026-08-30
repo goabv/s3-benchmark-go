@@ -218,14 +218,21 @@ go build -o tmbench ./cmd/tmbench      # requires Go 1.26+
 ```
 
 Credentials resolve via the default AWS chain (env, shared config, SSO, or the EC2
-instance role). Edit `bench.config.json` for your `bucket` / `region` / `sizes`,
-then seed and run:
+instance role). Everything else — the download `api`, `partSize`, `getObjectType`,
+concurrency, `deliveryPath`, and the O_DIRECT knobs — comes from `bench.config.json`,
+so edit that (at minimum `bucket` / `region` / `sizes`, and the `tmOptimized.download`
+section for the optimized profile), then seed and run:
 
 ```sh
-./tmbench -mode seed                                    # idempotent data-prep (skips existing)
-./tmbench -mode both -profile baseline                  # upload then download, pristine TM
-./tmbench -mode download -profile optimized -download-api download-file -part-size 8MiB
+./tmbench -mode seed                        # idempotent data-prep (skips existing)
+./tmbench -mode both -profile baseline      # upload then download, pristine TM baseline
+./tmbench -mode download -profile optimized # download using tmOptimized.download from config
 ```
+
+`-profile` picks which config section drives the run (`transferManager` vs
+`tmOptimized`); the download API (`download-file`), range size (`partSize`), and all
+other tunables are read from that section — no per-run flags needed. (Flags like
+`-download-api` / `-part-size` exist only as one-off overrides.)
 
 Or use the helper `./scripts/tm-run.sh <mode> [label] [extra tmbench flags...]`,
 which builds if needed, raises `ulimit -n`, runs, and captures the run under
