@@ -199,42 +199,59 @@ defaults to 80% of system RAM. Lower it to make the GC collect harder and hold p
 RSS down (keep it above the live working set or the GC thrashes). `GOGC` is also
 honored from the environment.
 
-## Run on EC2
+## Build and run
 
-You develop on Windows and build **on the instance**; S3 is the transport for the
-source, so no SSH key handling is needed for the code.
+Clone this repo **and the fork side-by-side**. The `go.mod` `replace` points at
+`../aws-sdk-go-v2/feature/s3/transfermanager`, so the fork must sit next to this repo
+for the build to resolve:
 
-1. **Push source from Windows** (syncs to `s3://<bucket>/<codePrefix>`):
+```sh
+git clone https://github.com/goabv/s3-benchmark-go.git
+git clone --depth 1 -b transfermanager-downloadfile https://github.com/goabv/aws-sdk-go-v2.git
 
-   ```powershell
-   ./scripts/push.ps1
-   ```
+# resulting layout (siblings):
+#   ./s3-benchmark-go     <- this repo
+#   ./aws-sdk-go-v2       <- the DownloadFile fork (branch transfermanager-downloadfile)
 
-2. **On the instance** — pull, build, tune once, seed, and run:
+cd s3-benchmark-go
+go build -o tmbench ./cmd/tmbench      # requires Go 1.26+
+```
 
-   ```sh
-   ./scripts/pull.sh                       # sync source from S3, install Go if absent, build tmbench
-   sudo ./scripts/tune-network.sh          # one-time: BBR, big buffers, initcwnd (--revert to undo)
-   ./scripts/tm-run.sh seed                # idempotent data-prep (skips existing objects)
-   ./scripts/tm-run.sh both baseline       # upload then download (baseline profile)
-   ./scripts/tm-run.sh download df -profile optimized -download-api download-file -part-size 8MiB
-   ```
+Credentials resolve via the default AWS chain (env, shared config, SSO, or the EC2
+instance role). Edit `bench.config.json` for your `bucket` / `region` / `sizes`,
+then seed and run:
 
-   `tm-run.sh <mode> [label] [extra tmbench flags...]` builds `./tmbench`, raises
-   `ulimit -n`, runs, and — with `results.upload` set — mirrors the whole run
-   directory to `s3://<bucket>/results/runs/<stamp>[-label]/`.
+```sh
+./tmbench -mode seed                                    # idempotent data-prep (skips existing)
+./tmbench -mode both -profile baseline                  # upload then download, pristine TM
+./tmbench -mode download -profile optimized -download-api download-file -part-size 8MiB
+```
 
-3. **Pull results back to Windows and commit:**
+Or use the helper `./scripts/tm-run.sh <mode> [label] [extra tmbench flags...]`,
+which builds if needed, raises `ulimit -n`, runs, and captures the run under
+`results/runs/<stamp>[-label]/` (mirroring it to S3 when `results.upload` is set).
 
-   ```powershell
-   ./scripts/pull-results.ps1               # sync S3 -> results/runs/
-   ./scripts/pull-results.ps1 -Commit -Push # sync, then commit only results/runs/
-   ```
+On an EC2 host, one-time network tuning helps at 100+ Gbps:
 
-The instance role must allow `s3:GetObject`/`HeadObject` (download + the seed
-skip-existing check), `s3:PutObject` + multipart actions (upload / seed),
-`s3:GetObject`/`ListBucket` on the code prefix (pull), and `s3:PutObject` on the
-results prefix (`results.upload`).
+```sh
+sudo ./scripts/tune-network.sh          # BBR, big buffers, initcwnd (--revert to undo)
+```
+
+The AWS identity needs `s3:GetObject`/`HeadObject` (download + the seed skip-existing
+check), `s3:PutObject` + multipart actions (upload / seed), and `s3:PutObject` on the
+results prefix if `results.upload` is set.
+
+<details>
+<summary>Alternative: S3-staged workflow (develop on Windows, build on EC2)</summary>
+
+If you'd rather not push code over git, the `scripts/push.ps1` / `scripts/pull.sh` /
+`scripts/pull-results.ps1` helpers stage source and results through S3 instead:
+`push.ps1` syncs the workspace to `s3://<bucket>/<codePrefix>`, `pull.sh` syncs it
+onto the instance (installing Go and building `tmbench`), and `pull-results.ps1`
+pulls captured runs back. Note `pull.sh` builds only `tmbench`, so the fork still has
+to be checked out next to the benchmark (`../aws-sdk-go-v2`) for the `replace` to
+resolve.
+</details>
 
 ## Output
 
