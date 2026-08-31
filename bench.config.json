@@ -4,63 +4,14 @@
   "dataPrefix": "bench/",
   "codePrefix": "code-go/",
   "sizes": [{ "size": "1024GiB", "count": 5 }],
-  "partSize": "8MiB",
   "checksum": "CRC32",
-  "memoryLimit": "50GiB",
-
-  "download": {
-    "workers": 64,
-    "concurrency": 8,
-    "iterations": 1,
-    "warmup": 0,
-    "validateChecksum": true,
-    "spreadConnections": true,
-    "tls": true,
-    "deliveryMode": "ordered-stream",
-    "deliveryPath": "/tmp",
-    "maxBufferedBytes": 68719476736,
-    "maxRetries": 2,
-    "stallTimeoutMs": 30000
-  },
-
-  "upload": {
-    "workers": 64,
-    "concurrency": 4,
-    "iterations": 1,
-    "warmup": 0,
-    "keyPrefix": "bench-upload/",
-    "maxRetries": 2,
-    "stallTimeoutMs": 30000
-  },
+  "memoryLimit": "40GiB",
 
   "transferManager": {
     "download": {
-      "api": "download-object",
-      "getObjectType": "parts",
-      "sink": "file",
-      "deliveryPath": "/mnt/stripe/output",
-      "objectConcurrency": 5,
-      "concurrency": 640,
-      "iterations": 1,
-      "warmup": 0,
-      "validateChecksum": true,
-      "maxBufferedBytes": 68719476736,
-      "stallTimeoutMs": 30000
-    },
-    "upload": {
-      "objectConcurrency": 5,
-      "concurrency": 640,
-      "iterations": 1,
-      "warmup": 0,
-      "keyPrefix": "tm-upload/",
-      "stallTimeoutMs": 30000
-    }
-  },
-
-  "tmOptimized": {
-    "download": {
       "api": "download-file",
       "getObjectType": "ranges",
+      "partSize": "8MiB",
       "sink": "file",
       "deliveryPath": "/mnt/stripe/output",
       "objectConcurrency": 5,
@@ -70,18 +21,17 @@
       "validateChecksum": true,
       "maxBufferedBytes": 68719476736,
       "stallTimeoutMs": 30000,
-      "multiNIC": true,
-      "verifyFullChecksum": false,
+      "multiNIC": false,
       "directIOThreshold": "100MiB",
       "disableDirectIO": false,
       "writeChunkSize": "8MiB",
       "writeFlushWorkers": 16,
-      "writeFlushQueueDepth": 64,
-      "disableWriteBufferPool": false
+      "writeFlushQueueDepth": 64
     },
     "upload": {
-      "objectConcurrency": 0,
+      "objectConcurrency": 5,
       "concurrency": 640,
+      "partSize": "128MiB",
       "iterations": 1,
       "warmup": 0,
       "keyPrefix": "tm-upload/",
