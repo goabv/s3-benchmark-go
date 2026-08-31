@@ -1,27 +1,24 @@
 #!/usr/bin/env bash
-# Run the AWS SDK for Go v2 Transfer Manager baseline ON THE EC2 INSTANCE and
-# capture a committable run under results/runs/<timestamp>[-label]/ (uploaded to
-# S3 when results.upload is set). Fully in-memory: upload streams from a repeating
-# buffer, download drains to /dev/null — no local files.
+# Run the AWS SDK for Go v2 Transfer Manager ON THE EC2 INSTANCE and capture a
+# committable run under results/runs/<timestamp>[-label]/ (uploaded to S3 when
+# results.upload is set). All knobs come from bench.config.json (transferManager
+# section); upload streams from a random in-memory block, download writes to disk.
 #
 # Usage:
-#   ./scripts/tm-run.sh seed                 # idempotent data-prep (skips existing)
-#   ./scripts/tm-run.sh [both]     [label]   # DEFAULT: upload then download
-#   ./scripts/tm-run.sh download   [label]
+#   ./scripts/tm-run.sh [download] [label]   # DEFAULT: download
 #   ./scripts/tm-run.sh upload     [label]
-#   ./scripts/tm-run.sh download my-label -profile optimized -download-api download-file
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MODE="${1:-both}"
+MODE="${1:-download}"
 LABEL="${2:-}"
 shift || true
 shift || true # drop mode + optional label; remaining args pass through to tmbench
 
 case "$MODE" in
-  seed | both | download | upload) ;;
+  download | upload) ;;
   *)
-    echo "unknown mode '${MODE}' (use seed | both | download | upload)" >&2
+    echo "unknown mode '${MODE}' (use download | upload)" >&2
     exit 1
     ;;
 esac
@@ -41,7 +38,7 @@ LABEL_ARGS=()
 if [[ -n "$LABEL" ]]; then LABEL_ARGS=(-label "$LABEL"); fi
 
 echo ">> host:  $(hostname)  cpus=$(nproc)  ulimit -n=$(ulimit -n)"
-echo ">> Transfer Manager baseline  mode:$MODE  label:${LABEL:-<none>}"
+echo ">> Transfer Manager  mode:$MODE  label:${LABEL:-<none>}"
 
 START="$(date +%s)"
 ./tmbench -config bench.config.json -mode "$MODE" "${LABEL_ARGS[@]}" "$@"

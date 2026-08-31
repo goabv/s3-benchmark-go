@@ -19,55 +19,8 @@ type SizeSpec struct {
 	Count int    `json:"count"`
 }
 
-// Download holds the download-benchmark knobs.
-type Download struct {
-	Workers           int  `json:"workers"`
-	Concurrency       int  `json:"concurrency"`
-	Iterations        int  `json:"iterations"`
-	Warmup            int  `json:"warmup"`
-	ValidateChecksum  bool `json:"validateChecksum"`
-	SpreadConnections bool `json:"spreadConnections"`
-	TLS               bool `json:"tls"`
-	// DeliveryMode selects the sink each downloaded part is written to:
-	//   "discard"        - drain + count bytes, no sink (default; lowest memory)
-	//   "ordered-stream" - reassemble parts in ascending order via a buffer pool,
-	//                      bounded by MaxBufferedBytes (models in-order streaming)
-	//   "file"           - write each part to disk at its byte offset under DeliveryPath
-	DeliveryMode string `json:"deliveryMode"`
-	// DeliveryPath is the directory for "file" delivery mode.
-	DeliveryPath string `json:"deliveryPath"`
-	// MaxBufferedBytes caps the ordered-stream reorder buffer (0 = bounded only by
-	// parallelism x partSize).
-	MaxBufferedBytes int64 `json:"maxBufferedBytes"`
-	// MaxRetries is the number of extra attempts per part on transient failure.
-	MaxRetries int `json:"maxRetries"`
-	// StallTimeoutMs trips the watchdog when no bytes move for this long (0 = default).
-	StallTimeoutMs int `json:"stallTimeoutMs"`
-}
-
-// Upload holds the multipart-PUT benchmark knobs.
-type Upload struct {
-	Workers        int    `json:"workers"`
-	Concurrency    int    `json:"concurrency"`
-	Iterations     int    `json:"iterations"`
-	Warmup         int    `json:"warmup"`
-	KeyPrefix      string `json:"keyPrefix"`
-	MaxRetries     int    `json:"maxRetries"`
-	StallTimeoutMs int    `json:"stallTimeoutMs"`
-}
-
-// Parallelism mirrors the workers x concurrency-per-worker model.
-func (u Upload) Parallelism() int {
-	p := u.Workers * u.Concurrency
-	if p < 1 {
-		return 1
-	}
-	return p
-}
-
-// TMDownload holds the Transfer Manager (v2 baseline) download knobs, expressed
-// directly rather than derived from a workers x concurrency product. Consumed by
-// cmd/tmbench; the optimized/custom runner (cmd/bench) uses Download instead.
+// TMDownload holds the Transfer Manager download knobs, expressed directly rather
+// than derived from a workers x concurrency product. Consumed by cmd/tmbench.
 type TMDownload struct {
 	API               string `json:"api"`               // "get" (GetObject stream) | "download-object" (WriterAt, parallel)
 	GetObjectType     string `json:"getObjectType"`     // "parts" (PartNumber) | "ranges" (byte ranges of partSize)
@@ -75,21 +28,20 @@ type TMDownload struct {
 	DeliveryPath      string `json:"deliveryPath"`      // directory for sink=file
 	ObjectConcurrency int    `json:"objectConcurrency"` // objects in parallel (0 = object count)
 	Concurrency       int    `json:"concurrency"`       // per-object part concurrency (0 = SDK default)
-	Iterations        int    `json:"iterations"`
-	Warmup            int    `json:"warmup"`
-	ValidateChecksum  bool   `json:"validateChecksum"`
-	MaxBufferedBytes  int64  `json:"maxBufferedBytes"` // GetObject read-ahead ("get" API only)
+	// PartSize is the download range/part size, e.g. "8MiB"; for download-file it is
+	// the ranged-GET size the SDK reads and coalesces. Independent of the upload
+	// part size (they live in their own sections).
+	PartSize         string `json:"partSize"`
+	Iterations       int    `json:"iterations"`
+	Warmup           int    `json:"warmup"`
+	ValidateChecksum bool   `json:"validateChecksum"`
+	MaxBufferedBytes int64  `json:"maxBufferedBytes"` // GetObject read-ahead ("get" API only)
 	StallTimeoutMs    int    `json:"stallTimeoutMs"`
 	// MultiNIC (optimized profile only) round-robins outbound connections across
 	// all of the host's ENI source IPs to spread load over multiple network cards.
 	// Requires host-side policy routing (scripts/setup-multinic.sh). Baseline
 	// leaves this false.
 	MultiNIC bool `json:"multiNIC"`
-	// VerifyFullChecksum (file sink only) re-reads each fully-downloaded file and
-	// checks its CRC-32 over the ENTIRE object before deleting it. This read-back
-	// + hash runs AFTER the timed region, so it never counts toward the measured
-	// download throughput. Baseline leaves this false.
-	VerifyFullChecksum bool `json:"verifyFullChecksum"`
 	// DirectIOThreshold (api=download-file only) is the object-size threshold, e.g.
 	// "100MiB", above which the SDK's DownloadFile writes with O_DIRECT; smaller
 	// objects use a buffered writer. Empty uses the SDK default (100 MiB).
@@ -111,10 +63,6 @@ type TMDownload struct {
 	// WriteFlushQueueDepth (api=download-file only) is the depth of the bounded queue
 	// feeding the DownloadFile flush workers. 0 uses the SDK default (64).
 	WriteFlushQueueDepth int `json:"writeFlushQueueDepth"`
-
-	// DisableWriteBufferPool (api=download-file only) turns off O_DIRECT region-buffer
-	// pooling in the SDK's DownloadFile sink (A/B pooled vs raw-malloc).
-	DisableWriteBufferPool bool `json:"disableWriteBufferPool"`
 }
 
 // StallTimeout returns the TM download stall-watchdog timeout.
@@ -124,12 +72,17 @@ func (d TMDownload) StallTimeout() time.Duration {
 
 // TMUpload holds the Transfer Manager (v2 baseline) upload knobs.
 type TMUpload struct {
-	ObjectConcurrency int    `json:"objectConcurrency"` // objects in parallel (0 = object count)
-	Concurrency       int    `json:"concurrency"`       // per-object part concurrency (0 = SDK default)
-	Iterations        int    `json:"iterations"`
-	Warmup            int    `json:"warmup"`
-	KeyPrefix         string `json:"keyPrefix"`
-	StallTimeoutMs    int    `json:"stallTimeoutMs"`
+	ObjectConcurrency int `json:"objectConcurrency"` // objects in parallel (0 = object count)
+	Concurrency       int `json:"concurrency"`       // per-object part concurrency (0 = SDK default)
+	// PartSize is the multipart upload part size, e.g. "128MiB". It must be large
+	// enough that objectSize/partSize <= 10000 (S3's max parts) or the upload fails;
+	// the SDK only auto-upsizes when it knows the body length, which streamed
+	// uploads do not provide. Independent of the download part size.
+	PartSize       string `json:"partSize"`
+	Iterations     int    `json:"iterations"`
+	Warmup         int    `json:"warmup"`
+	KeyPrefix      string `json:"keyPrefix"`
+	StallTimeoutMs int    `json:"stallTimeoutMs"`
 }
 
 // StallTimeout returns the TM upload stall-watchdog timeout.
@@ -137,17 +90,15 @@ func (u TMUpload) StallTimeout() time.Duration {
 	return time.Duration(u.StallTimeoutMs) * time.Millisecond
 }
 
-// TransferManager is the TM v2 baseline section (cmd/tmbench), kept separate from
-// the optimized custom runner's Download/Upload sections so the two never share
-// meaning. Concurrency is set directly here rather than derived.
+// TransferManager is the TM config section (cmd/tmbench). Concurrency is set
+// directly here rather than derived from a workers x concurrency product.
 type TransferManager struct {
 	Download TMDownload `json:"download"`
 	Upload   TMUpload   `json:"upload"`
 }
 
-// applyTMDefaults fills unset fields of a Transfer Manager section (baseline or
-// optimized) with defaults. ObjectConcurrency/Concurrency are intentionally left
-// at 0 ("auto").
+// applyTMDefaults fills unset fields of the Transfer Manager section with
+// defaults. ObjectConcurrency/Concurrency are intentionally left at 0 ("auto").
 func applyTMDefaults(tm *TransferManager) {
 	d := &tm.Download
 	if d.API == "" {
@@ -162,6 +113,9 @@ func applyTMDefaults(tm *TransferManager) {
 	if d.DeliveryPath == "" {
 		d.DeliveryPath = os.TempDir()
 	}
+	if d.PartSize == "" {
+		d.PartSize = "8MiB"
+	}
 	if d.Iterations <= 0 {
 		d.Iterations = 1
 	}
@@ -169,6 +123,10 @@ func applyTMDefaults(tm *TransferManager) {
 		d.StallTimeoutMs = 30000
 	}
 	u := &tm.Upload
+	if u.PartSize == "" {
+		// Large enough that a 1 TiB object stays under S3's 10000-part cap.
+		u.PartSize = "128MiB"
+	}
 	if u.Iterations <= 0 {
 		u.Iterations = 1
 	}
@@ -203,7 +161,6 @@ type Config struct {
 	DataPrefix string     `json:"dataPrefix"`
 	CodePrefix string     `json:"codePrefix"`
 	Sizes      []SizeSpec `json:"sizes"`
-	PartSize   string     `json:"partSize"`
 	Checksum   string     `json:"checksum"`
 	// MemoryLimit sets Go's soft memory limit (GOMEMLIMIT equivalent) as an
 	// absolute value, e.g. "40GiB". Empty = default (80% of system RAM). Lower it
@@ -211,16 +168,9 @@ type Config struct {
 	// live working set (objectConcurrency x concurrency x region size) or the GC
 	// will thrash.
 	MemoryLimit     string          `json:"memoryLimit"`
-	Download        Download        `json:"download"`
-	Upload          Upload          `json:"upload"`
 	TransferManager TransferManager `json:"transferManager"`
-	// TMOptimized is the "optimized" TM profile (cmd/tmbench -profile optimized):
-	// same shape as TransferManager but carries the optimization knobs (multiNIC,
-	// the DownloadFile O_DIRECT controls). transferManager stays the pristine
-	// baseline; all mods live here.
-	TMOptimized TransferManager `json:"tmOptimized"`
-	Sampling    Sampling        `json:"sampling"`
-	Results     Results         `json:"results"`
+	Sampling        Sampling        `json:"sampling"`
+	Results         Results         `json:"results"`
 }
 
 // Load reads and parses a bench.config.json file.
@@ -238,60 +188,14 @@ func Load(path string) (*Config, error) {
 }
 
 func (c *Config) applyDefaults() {
-	if c.PartSize == "" {
-		c.PartSize = "16MiB"
-	}
 	if c.CodePrefix == "" {
 		c.CodePrefix = "code/"
 	}
 
-	if c.Download.Workers <= 0 {
-		c.Download.Workers = 32
-	}
-	if c.Download.Concurrency <= 0 {
-		c.Download.Concurrency = 1
-	}
-	if c.Download.Iterations <= 0 {
-		c.Download.Iterations = 1
-	}
-	if c.Download.MaxRetries <= 0 {
-		c.Download.MaxRetries = 2
-	}
-	if c.Download.StallTimeoutMs <= 0 {
-		c.Download.StallTimeoutMs = 30000
-	}
-	if c.Download.DeliveryMode == "" {
-		c.Download.DeliveryMode = "discard"
-	}
-	if c.Download.DeliveryPath == "" {
-		c.Download.DeliveryPath = os.TempDir()
-	}
-
-	if c.Upload.Workers <= 0 {
-		c.Upload.Workers = 32
-	}
-	if c.Upload.Concurrency <= 0 {
-		c.Upload.Concurrency = 1
-	}
-	if c.Upload.Iterations <= 0 {
-		c.Upload.Iterations = 1
-	}
-	if c.Upload.MaxRetries <= 0 {
-		c.Upload.MaxRetries = 2
-	}
-	if c.Upload.StallTimeoutMs <= 0 {
-		c.Upload.StallTimeoutMs = 30000
-	}
-	if c.Upload.KeyPrefix == "" {
-		c.Upload.KeyPrefix = "bench-upload/"
-	}
-
-	// Transfer Manager defaults, applied to both the baseline (transferManager)
-	// and optimized (tmOptimized) sections. ObjectConcurrency/Concurrency stay
-	// 0 = "auto" and are resolved by cmd/tmbench (0 objects -> object count; 0
-	// per-object -> SDK default).
+	// Transfer Manager defaults. ObjectConcurrency/Concurrency stay 0 = "auto" and
+	// are resolved by cmd/tmbench (0 objects -> object count; 0 per-object -> SDK
+	// default).
 	applyTMDefaults(&c.TransferManager)
-	applyTMDefaults(&c.TMOptimized)
 
 	if c.Sampling.IntervalMs <= 0 {
 		c.Sampling.IntervalMs = 250
@@ -305,24 +209,10 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-// StallTimeout returns the download stall-watchdog timeout.
-func (d Download) StallTimeout() time.Duration {
-	return time.Duration(d.StallTimeoutMs) * time.Millisecond
-}
-
-// StallTimeout returns the upload stall-watchdog timeout.
-func (u Upload) StallTimeout() time.Duration {
-	return time.Duration(u.StallTimeoutMs) * time.Millisecond
-}
-
 // SampleInterval returns the resource-sampler tick interval.
 func (s Sampling) SampleInterval() time.Duration {
 	return time.Duration(s.IntervalMs) * time.Millisecond
 }
-
-// Parallelism is the number of concurrent in-flight requests to drive: it mirrors
-// the JS model of workers x concurrency-per-worker.
-func (d Download) Parallelism() int { return d.Workers * d.Concurrency }
 
 // KeysFor expands a SizeSpec into its object keys, matching the JS keyForSize:
 //

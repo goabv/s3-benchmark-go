@@ -54,6 +54,5 @@ chmod +x scripts/*.sh 2>/dev/null || true
 
 echo "Ready in ${DEST}. All settings live in bench.config.json. Examples:"
 echo "  sudo ./scripts/tune-network.sh          # one-time network tuning (persists)"
-echo "  ./scripts/tm-run.sh seed                # idempotent data-prep (skips existing)"
-echo "  ./scripts/tm-run.sh both baseline       # upload then download (baseline profile)"
-echo "  ./scripts/tm-run.sh download df -profile optimized -download-api download-file"
+echo "  ./scripts/tm-run.sh upload reseed       # (re)write the objects the download reads"
+echo "  ./scripts/tm-run.sh download my-label   # download benchmark"

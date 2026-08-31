@@ -32,4 +32,4 @@ aws s3 sync $root $dest `
   --exclude "*.log" `
   @regionArg
 
-Write-Host "Done. On the EC2 box run: ./scripts/pull.sh   then ./scripts/run.sh both <label>"
+Write-Host "Done. On the EC2 box run: ./scripts/pull.sh   then ./scripts/tm-run.sh download <label>"

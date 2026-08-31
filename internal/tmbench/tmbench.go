@@ -14,9 +14,8 @@ package tmbench
 
 import (
 	"context"
-	"errors"
+	"crypto/rand"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -28,17 +27,17 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/smithy-go"
 
 	"github.com/goabv/s3-benchmark-go/internal/bench"
 	"github.com/goabv/s3-benchmark-go/internal/config"
 	"github.com/goabv/s3-benchmark-go/internal/metrics"
 )
 
-// sizedReader yields exactly `remaining` bytes drawn from a small repeating
-// pattern, so an arbitrarily large object body can be produced without holding
-// the whole object in memory. It reports bytes read into prog for live sampling.
+// sizedReader yields exactly `remaining` bytes drawn from a small in-memory
+// block (repeated as needed), so an arbitrarily large object body can be produced
+// without holding the whole object in memory. Callers pass a freshly randomized
+// block per object (see makePattern) so distinct objects get distinct content.
+// It reports bytes read into prog for live sampling.
 type sizedReader struct {
 	remaining int64
 	pattern   []byte
@@ -126,69 +125,6 @@ type countingSink interface {
 	written() int64
 }
 
-// RunSeed uploads the configured object sizes to the download data prefix
-// (cfg.KeysFor keys — the exact keys the download reads), skipping any object that
-// already exists, so the download benchmark has data to read. It uses HeadObject
-// (via the raw S3 client) to skip existing objects and the Transfer Manager's
-// UploadObject to write missing ones from a small repeating in-memory pattern (no
-// whole-object allocation). Idempotent and safe to re-run; it neither samples nor
-// produces a report.
-func RunSeed(ctx context.Context, tm *transfermanager.Client, s3c *s3.Client, cfg *config.Config, prog *metrics.Progress) error {
-	if prog == nil {
-		prog = &metrics.Progress{}
-	}
-	pattern := makePattern()
-	fmt.Printf("=== Seeding download data to s3://%s/%s ===\n", cfg.Bucket, cfg.DataPrefix)
-	for _, spec := range cfg.Sizes {
-		sizeBytes, err := config.ParseSize(spec.Size)
-		if err != nil {
-			return fmt.Errorf("parse size %q: %w", spec.Size, err)
-		}
-		for _, key := range cfg.KeysFor(spec) {
-			exists, err := objectExists(ctx, s3c, cfg.Bucket, key)
-			if err != nil {
-				return fmt.Errorf("head %q: %w", key, err)
-			}
-			if exists {
-				fmt.Printf("  skip (exists): %s\n", key)
-				continue
-			}
-			fmt.Printf("  seeding: %s (%s)\n", key, spec.Size)
-			atomic.AddInt64(&prog.InFlight, 1)
-			_, err = tm.UploadObject(ctx, &transfermanager.UploadObjectInput{
-				Bucket: aws.String(cfg.Bucket),
-				Key:    aws.String(key),
-				Body:   &sizedReader{remaining: sizeBytes, pattern: pattern, prog: prog},
-			})
-			atomic.AddInt64(&prog.InFlight, -1)
-			if err != nil {
-				return fmt.Errorf("seed %q: %w", key, err)
-			}
-		}
-	}
-	fmt.Printf("=== Seeding complete ===\n")
-	return nil
-}
-
-// objectExists reports whether an object is present via HeadObject.
-func objectExists(ctx context.Context, s3c *s3.Client, bucket, key string) (bool, error) {
-	_, err := s3c.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
-	})
-	if err == nil {
-		return true, nil
-	}
-	var apiErr smithy.APIError
-	if errors.As(err, &apiErr) {
-		switch apiErr.ErrorCode() {
-		case "NotFound", "NoSuchKey", "404":
-			return false, nil
-		}
-	}
-	return false, err
-}
-
 // RunUpload uploads `count` in-memory objects per size group via the Transfer
 // Manager's UploadObject (which multiparts automatically). Objects transfer
 // concurrently through a pool of objectConcurrency; each object's parts run at
@@ -197,11 +133,10 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 	if prog == nil {
 		prog = &metrics.Progress{}
 	}
-	partSize, err := config.ParseSize(cfg.PartSize)
+	partSize, err := config.ParseSize(sec.Upload.PartSize)
 	if err != nil {
-		return nil, fmt.Errorf("parse partSize %q: %w", cfg.PartSize, err)
+		return nil, fmt.Errorf("parse upload partSize %q: %w", sec.Upload.PartSize, err)
 	}
-	pattern := makePattern()
 
 	fmt.Printf("=== S3 Transfer Manager UPLOAD benchmark (feature/s3/transfermanager) ===\n")
 	// Upload writes the SAME keys the download reads (cfg.KeysFor under dataPrefix),
@@ -235,9 +170,12 @@ func RunUpload(ctx context.Context, tm *transfermanager.Client, cfg *config.Conf
 				_, e := tm.UploadObject(ctx, &transfermanager.UploadObjectInput{
 					Bucket: aws.String(cfg.Bucket),
 					Key:    aws.String(key),
-					Body:   &sizedReader{remaining: sizeBytes, pattern: pattern, prog: prog},
+					Body:   &sizedReader{remaining: sizeBytes, pattern: makePattern(), prog: prog},
 				}, func(o *transfermanager.Options) {
 					o.Concurrency = perObjectConcurrency
+					if partSize > 0 {
+						o.PartSizeBytes = partSize
+					}
 				})
 				atomic.AddInt64(&prog.InFlight, -1)
 				if e != nil {
@@ -486,12 +424,8 @@ func RunDownloadFile(ctx context.Context, tm *transfermanager.Client, cfg *confi
 	if sec.Download.DisableDirectIO {
 		writeMode = "buffered (O_DIRECT disabled)"
 	}
-	pooling := "pooled region buffers"
-	if sec.Download.DisableWriteBufferPool {
-		pooling = "non-pooled region buffers"
-	}
 	fmt.Printf("=== S3 Transfer Manager DOWNLOAD benchmark (DownloadFile, SDK-owned file sink) ===\n")
-	fmt.Printf("region=%s  bucket=%s  deliveryPath=%s  get-object-type=%s  write=%s  %s\n", cfg.Region, cfg.Bucket, deliveryPath, getObjType, writeMode, pooling)
+	fmt.Printf("region=%s  bucket=%s  deliveryPath=%s  get-object-type=%s  write=%s\n", cfg.Region, cfg.Bucket, deliveryPath, getObjType, writeMode)
 	fmt.Printf("object-concurrency=%d  per-object part-concurrency=%d  ~parts-in-flight=%d  flush-workers=%d  flush-queue=%d  iterations=%d (warmup=%d)\n\n",
 		objectConcurrency, perObjectConcurrency, objectConcurrency*perObjectConcurrency, flushWorkers, flushQueue, sec.Download.Iterations, sec.Download.Warmup)
 
@@ -533,7 +467,6 @@ func RunDownloadFile(ctx context.Context, tm *transfermanager.Client, cfg *confi
 					}
 					o.WriteFlushWorkers = flushWorkers
 					o.WriteFlushQueueDepth = flushQueue
-					o.DisableWriteBufferPool = sec.Download.DisableWriteBufferPool
 					o.ObjectProgressListeners.Register(listener)
 				})
 				if e != nil {
@@ -637,10 +570,17 @@ func group(spec config.SizeSpec, perFileSize int64, files, nparts, objectConc, p
 	}
 }
 
+// makePattern returns a 1 MiB block of cryptographically-random bytes. The block
+// is filled once at startup and then streamed repeatedly by sizedReader, so the
+// upload hot path stays a plain memcpy (no per-read RNG cost that would cap the
+// measured throughput) while the uploaded content is unstructured/incompressible.
+// The bytes are non-deterministic — they differ every process run, so uploaded
+// objects cannot be verified against a regenerated pattern; verify against S3's
+// own stored checksum instead.
 func makePattern() []byte {
 	p := make([]byte, 1<<20) // 1 MiB
-	for i := range p {
-		p[i] = byte(i * 31)
+	if _, err := rand.Read(p); err != nil {
+		panic(fmt.Sprintf("tmbench: read random upload data: %v", err))
 	}
 	return p
 }
@@ -674,42 +614,6 @@ func bestSample(ss []bench.Sample3) bench.Sample3 {
 	return b
 }
 
-// VerifyDownloadedFiles re-reads each downloaded file (cfg.KeysFor under
-// deliveryPath) and checks its full-object CRC-32 against the expected data
-// pattern. It is meant to run OUTSIDE the sampled/timed region (see
-// cmd/tmbench runPhase), so its cost is never counted in throughput or resource
-// stats. It does NOT delete the files — start-of-run cleanup owns deletion.
-//
-// Verification is serial and reads every byte back from disk, so it can take a
-// while for large objects; that is why it defaults off and is opt-in via the
-// download.verifyFullChecksum config flag.
-func VerifyDownloadedFiles(cfg *config.Config, deliveryPath string) {
-	if deliveryPath == "" {
-		deliveryPath = "."
-	}
-	for _, spec := range cfg.Sizes {
-		size, err := config.ParseSize(spec.Size)
-		if err != nil {
-			fmt.Printf("  [verify] size %q: parse error: %v\n", spec.Size, err)
-			continue
-		}
-		want := expectedPatternCRC32(size)
-		for _, key := range cfg.KeysFor(spec) {
-			path := filepath.Join(deliveryPath, sanitize(key))
-			fmt.Printf("  [verify] %s: hashing %d bytes ...\n", key, size)
-			got, cerr := fileCRC32IEEE(path)
-			switch {
-			case cerr != nil:
-				fmt.Printf("  [verify] %s: read error: %v\n", key, cerr)
-			case got == want:
-				fmt.Printf("  [verify] %s: CRC32 OK (0x%08x over %d bytes)\n", key, got, size)
-			default:
-				fmt.Printf("  [verify] %s: CRC32 MISMATCH got=0x%08x want=0x%08x\n", key, got, want)
-			}
-		}
-	}
-}
-
 func sanitize(s string) string {
 	out := make([]byte, 0, len(s))
 	for _, c := range []byte(s) {
@@ -721,53 +625,4 @@ func sanitize(s string) string {
 		}
 	}
 	return string(out)
-}
-
-// fileCRC32IEEE reads the whole file at path and returns its CRC-32 (IEEE)
-// checksum over the entire contents. Used by VerifyDownloadedFiles (the untimed,
-// out-of-phase full-object verification) to confirm the object landed on disk intact.
-func fileCRC32IEEE(path string) (uint32, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	h := crc32.NewIEEE()
-	buf := make([]byte, 8<<20)
-	for {
-		n, rerr := f.Read(buf)
-		if n > 0 {
-			h.Write(buf[:n])
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			return 0, rerr
-		}
-	}
-	return h.Sum32(), nil
-}
-
-// expectedPatternCRC32 returns the CRC-32 (IEEE) of `size` bytes of the upload
-// data pattern (byte(offset*31)), matching makePattern and the seeder. Because
-// the pattern is continuous across the whole object (its 256-byte period divides
-// every part/tile size), this reproduces the exact bytes a correct download
-// should have written — without a second download.
-func expectedPatternCRC32(size int64) uint32 {
-	tile := make([]byte, 1<<20) // 1 MiB = whole number of 256-byte pattern periods
-	for i := range tile {
-		tile[i] = byte(i * 31)
-	}
-	h := crc32.NewIEEE()
-	remaining := size
-	for remaining > 0 {
-		n := int64(len(tile))
-		if n > remaining {
-			n = remaining
-		}
-		h.Write(tile[:n])
-		remaining -= n
-	}
-	return h.Sum32()
 }
