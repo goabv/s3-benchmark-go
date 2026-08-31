@@ -5,7 +5,7 @@
   "codePrefix": "code-go/",
   "sizes": [{ "size": "1024GiB", "count": 5 }],
   "checksum": "CRC32",
-  "memoryLimit": "40GiB",
+  "memoryLimit": "20GiB",
 
   "transferManager": {
     "download": {
@@ -15,7 +15,7 @@
       "sink": "file",
       "deliveryPath": "/mnt/stripe/output",
       "objectConcurrency": 5,
-      "concurrency": 640,
+      "concurrency": 256,
       "iterations": 1,
       "warmup": 0,
       "validateChecksum": true,
