@@ -25,7 +25,7 @@
       "directIOThreshold": "100MiB",
       "disableDirectIO": false,
       "writeChunkSize": "8MiB",
-      "writeFlushWorkers": 16,
+      "writeFlushWorkers": 10,
       "writeFlushQueueDepth": 64
     },
     "upload": {
