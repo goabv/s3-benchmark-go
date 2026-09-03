@@ -29,10 +29,12 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/goabv/s3-benchmark-go/internal/bench"
 	"github.com/goabv/s3-benchmark-go/internal/config"
 	"github.com/goabv/s3-benchmark-go/internal/metrics"
+	"github.com/goabv/s3-benchmark-go/internal/profiling"
 	"github.com/goabv/s3-benchmark-go/internal/report"
 	"github.com/goabv/s3-benchmark-go/internal/s3client"
 	"github.com/goabv/s3-benchmark-go/internal/tmbench"
@@ -43,9 +45,26 @@ func main() {
 	mode := flag.String("mode", "download", "benchmark mode: upload | download")
 	label := flag.String("label", "", "optional run label (appended to the run directory name)")
 	progress := flag.Bool("progress", true, "print a live progress indicator to stderr")
+	pprofAddr := flag.String("pprof-addr", "", "if set, serve live pprof at this address (e.g. 127.0.0.1:6060)")
+	cpuProfile := flag.String("cpuprofile", "", "if set, write a CPU profile covering the run to this path")
+	blockProfile := flag.String("blockprofile", "", "if set, write a blocking profile covering the run to this path")
+	mutexProfile := flag.String("mutexprofile", "", "if set, write a mutex contention profile covering the run to this path")
 	flag.Parse()
 
-	if err := run(*cfgPath, *mode, *label, *progress); err != nil {
+	stopProfiling, err := profiling.Start(profiling.Options{
+		HTTPAddr:         *pprofAddr,
+		CPUProfilePath:   *cpuProfile,
+		BlockProfilePath: *blockProfile,
+		MutexProfilePath: *mutexProfile,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	err = run(*cfgPath, *mode, *label, *progress)
+	stopProfiling()
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
@@ -180,7 +199,7 @@ func run(cfgPath, mode, label string, progress bool) error {
 	}
 
 	// Exactly one phase runs: upload or download, sampled and reported on its own.
-	phases := phasesFor(mode, ctx, tm, cfg, *sec, upKeyPrefix, tmGetObjType, upObjConc, upPerObjConc, dlObjConc, dlPerObjConc, dlGetBuffer, dlPartSize)
+	phases := phasesFor(mode, ctx, tm, s3c, cfg, *sec, upKeyPrefix, tmGetObjType, upObjConc, upPerObjConc, dlObjConc, dlPerObjConc, dlGetBuffer, dlPartSize)
 
 	startedAt := time.Now()
 	var runs []*bench.RunResult
@@ -236,7 +255,7 @@ type phase struct {
 // phasesFor returns the single phase for the mode (upload or download). Upload and
 // download carry their own (object, per-object) concurrency, resolved per config
 // section.
-func phasesFor(mode string, ctx context.Context, tm *transfermanager.Client, cfg *config.Config, sec config.TransferManager, upKeyPrefix string, getObjType types.GetObjectType,
+func phasesFor(mode string, ctx context.Context, tm *transfermanager.Client, s3c *s3.Client, cfg *config.Config, sec config.TransferManager, upKeyPrefix string, getObjType types.GetObjectType,
 	upObjConc, upPerObjConc, dlObjConc, dlPerObjConc int, dlGetBuffer, bufSz int64) []phase {
 	upload := phase{name: "tm-upload", fn: func(p *metrics.Progress) (*bench.RunResult, error) {
 		return tmbench.RunUpload(ctx, tm, cfg, p, sec, upKeyPrefix, upObjConc, upPerObjConc)
@@ -246,7 +265,7 @@ func phasesFor(mode string, ctx context.Context, tm *transfermanager.Client, cfg
 		case "download-object":
 			return tmbench.RunDownloadObject(ctx, tm, cfg, p, sec, dlObjConc, dlPerObjConc, getObjType)
 		case "download-file":
-			return tmbench.RunDownloadFile(ctx, tm, cfg, p, sec, dlObjConc, dlPerObjConc, getObjType, bufSz)
+			return tmbench.RunDownloadFile(ctx, tm, s3c, cfg, p, sec, dlObjConc, dlPerObjConc, getObjType, bufSz)
 		default:
 			return tmbench.RunDownload(ctx, tm, cfg, p, sec, dlObjConc, dlPerObjConc, dlGetBuffer, getObjType)
 		}
